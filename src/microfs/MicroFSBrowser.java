@@ -267,8 +267,14 @@ public class MicroFSBrowser extends JFrame {
         diskComboBox.addActionListener(e -> {
             if (diskComboBox.getSelectedItem() != null) {
                 String selected = (String) diskComboBox.getSelectedItem();
-                // Extraer la letra de unidad del texto (formato: "F: - Label (X GB) [Type]")
-                if (selected.length() >= 2 && selected.charAt(1) == ':') {
+                // Formato: "F: - Label (X GB) [Type]|DiskNum|DriveLetter"
+                String[] parts = selected.split("\\|");
+                if (parts.length >= 2) {
+                    String diskNumber = parts[1].trim();
+                    // Usar PhysicalDrive para escritura directa (evita "El parámetro no es correcto")
+                    deviceField.setText("\\\\.\\PhysicalDrive" + diskNumber);
+                } else if (selected.length() >= 2 && selected.charAt(1) == ':') {
+                    // Fallback: usar letra de unidad
                     String driveLetter = selected.substring(0, 1);
                     deviceField.setText("\\\\.\\"+  driveLetter + ":");
                 }
@@ -296,6 +302,7 @@ public class MicroFSBrowser extends JFrame {
     
     /**
      * Detectar discos removibles usando PowerShell (Windows)
+     * Obtiene el PhysicalDriveN correspondiente a cada letra de unidad
      */
     private void detectPhysicalDisks() {
         diskComboBox.removeAllItems();
@@ -303,15 +310,18 @@ public class MicroFSBrowser extends JFrame {
         
         new Thread(() -> {
             try {
-                List<String> disks = new ArrayList<>();
+                List<String[]> disks = new ArrayList<>();
                 
-                // Usar PowerShell para obtener volúmenes removibles con su letra de unidad
+                // Usar PowerShell para obtener volúmenes removibles con su PhysicalDrive
                 ProcessBuilder pb = new ProcessBuilder(
                     "powershell", "-Command",
-                    "Get-Volume | Where-Object {$_.DriveType -eq 'Removable' -or $_.DriveType -eq 'Fixed'} | " +
-                    "Where-Object {$_.DriveLetter -ne $null} | " +
-                    "Select-Object DriveLetter, FileSystemLabel, @{N='SizeGB';E={[math]::Round($_.Size/1GB,2)}}, DriveType | " +
-                    "ForEach-Object { $_.DriveLetter + '|' + $_.FileSystemLabel + '|' + $_.SizeGB + '|' + $_.DriveType }"
+                    "Get-Partition | Where-Object {$_.DriveLetter -ne $null} | ForEach-Object { " +
+                    "$part = $_; " +
+                    "$vol = Get-Volume -Partition $part -ErrorAction SilentlyContinue; " +
+                    "if ($vol -and ($vol.DriveType -eq 'Removable')) { " +
+                    "  $part.DriveLetter + '|' + $part.DiskNumber + '|' + $vol.FileSystemLabel + '|' + [math]::Round($vol.Size/1GB,2) + '|' + $vol.DriveType " +
+                    "} " +
+                    "}"
                 );
                 pb.redirectErrorStream(true);
                 Process process = pb.start();
@@ -322,33 +332,37 @@ public class MicroFSBrowser extends JFrame {
                     line = line.trim();
                     if (!line.isEmpty() && line.contains("|")) {
                         String[] parts = line.split("\\|");
-                        if (parts.length >= 3) {
+                        if (parts.length >= 4) {
                             String driveLetter = parts[0].trim();
-                            String label = parts[1].trim();
-                            String sizeGB = parts[2].trim();
-                            String driveType = parts.length > 3 ? parts[3].trim() : "";
+                            String diskNumber = parts[1].trim();
+                            String label = parts[2].trim();
+                            String sizeGB = parts[3].trim();
+                            String driveType = parts.length > 4 ? parts[4].trim() : "Removable";
                             
                             if (label.isEmpty()) label = "Sin etiqueta";
                             
+                            // Guardar: [displayText, physicalDrive]
                             String displayText = String.format("%s: - %s (%.2f GB) [%s]", 
                                 driveLetter, label, Double.parseDouble(sizeGB.isEmpty() ? "0" : sizeGB), driveType);
-                            disks.add(displayText);
+                            disks.add(new String[]{displayText, diskNumber, driveLetter});
                         }
                     }
                 }
                 process.waitFor();
                 
                 // Actualizar combo en el hilo de UI
+                final List<String[]> finalDisks = disks;
                 SwingUtilities.invokeLater(() -> {
                     diskComboBox.removeAllItems();
-                    if (disks.isEmpty()) {
-                        diskComboBox.addItem("No se detectaron unidades");
-                        log("No se detectaron unidades");
+                    if (finalDisks.isEmpty()) {
+                        diskComboBox.addItem("No se detectaron unidades removibles");
+                        log("No se detectaron unidades removibles");
                     } else {
-                        for (String disk : disks) {
-                            diskComboBox.addItem(disk);
+                        for (String[] disk : finalDisks) {
+                            // Formato: "F: - Label (X GB) [Type]|DiskNum|DriveLetter"
+                            diskComboBox.addItem(disk[0] + "|" + disk[1] + "|" + disk[2]);
                         }
-                        log("Detectadas " + disks.size() + " unidad(es)");
+                        log("Detectadas " + finalDisks.size() + " unidad(es) removible(s)");
                     }
                 });
                 
@@ -411,13 +425,44 @@ public class MicroFSBrowser extends JFrame {
         byte[] buffer = new byte[SECTOR_SIZE];
         System.arraycopy(data, 0, buffer, 0, Math.min(data.length, SECTOR_SIZE));
         
-        // En Windows, usar FileOutputStream para dispositivos físicos
-        try (RandomAccessFile raf = new RandomAccessFile(currentDevice, "rws")) {
-            java.nio.channels.FileChannel channel = raf.getChannel();
-            java.nio.ByteBuffer byteBuffer = java.nio.ByteBuffer.wrap(buffer);
-            channel.position((long) sector * SECTOR_SIZE);
-            channel.write(byteBuffer);
-            channel.force(true);  // Forzar escritura a disco
+        // Crear archivo temporal con los datos del sector
+        File tempFile = File.createTempFile("microfs_sector_", ".bin");
+        try {
+            Files.write(tempFile.toPath(), buffer);
+            
+            // Usar PowerShell para escribir directamente al disco físico
+            // Esto evita las restricciones de Java con dispositivos raw
+            long offset = (long) sector * SECTOR_SIZE;
+            
+            ProcessBuilder pb = new ProcessBuilder(
+                "powershell", "-Command",
+                "$bytes = [System.IO.File]::ReadAllBytes('" + tempFile.getAbsolutePath().replace("'", "''") + "'); " +
+                "$fs = [System.IO.File]::Open('" + currentDevice.replace("'", "''") + "', " +
+                "[System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite); " +
+                "$fs.Seek(" + offset + ", [System.IO.SeekOrigin]::Begin) | Out-Null; " +
+                "$fs.Write($bytes, 0, $bytes.Length); " +
+                "$fs.Flush(); " +
+                "$fs.Close();"
+            );
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+            
+            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
+            StringBuilder output = new StringBuilder();
+            String line;
+            while ((line = reader.readLine()) != null) {
+                output.append(line).append("\n");
+            }
+            
+            int exitCode = process.waitFor();
+            if (exitCode != 0) {
+                throw new IOException("Error al escribir sector " + sector + ": " + output.toString().trim());
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("Escritura interrumpida", e);
+        } finally {
+            tempFile.delete();
         }
     }
     

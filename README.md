@@ -2,6 +2,8 @@
 
 Navegador gráfico de archivos para el sistema de archivos MicroFS en tarjetas SD.
 
+Compatible con el proyecto microfs-6502-cc65: https://github.com/nelsama/microfs-6502-cc65
+
 ## Requisitos
 
 - Java JDK 8 o superior
