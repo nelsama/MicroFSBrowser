@@ -1,318 +1,280 @@
 #!/usr/bin/env python3
 """
-MICROFS.PY - Herramienta para gestionar MicroFS en tarjetas SD
+MICROFS.PY - Herramienta de linea de comandos para MicroFS (microfs-6502-cc65)
+
+El formato es el del driver en C del 6502:
+    Sector 0 : tabla de archivos (firma "FM" en los bytes 0-1, next_sector en 6-7,
+               15 entradas de 32 bytes desde el offset 16)
+    Sector 1+: datos de los archivos, contiguos
 
 Uso:
-    python microfs.py <dispositivo> format              - Formatear SD
-    python microfs.py <dispositivo> list                - Listar archivos
-    python microfs.py <dispositivo> read <archivo>      - Leer archivo
-    python microfs.py <dispositivo> write <archivo> [datos]  - Escribir archivo
-    python microfs.py <dispositivo> delete <archivo>    - Eliminar archivo
-    python microfs.py <dispositivo> import <archivo> <local>  - Importar desde PC
-    python microfs.py <dispositivo> export <archivo> <local>  - Exportar a PC
+    python microfs.py <imagen> [--offset N] list
+    python microfs.py <imagen> [--offset N] read <archivo>
+    python microfs.py <imagen> [--offset N] export <archivo> <local>
+    python microfs.py <imagen> [--offset N] import <archivo> <local>
+    python microfs.py <imagen> [--offset N] delete <archivo>
+    python microfs.py <imagen> [--offset N] rename <archivo> <nuevo_nombre>
+    python microfs.py <imagen> [--offset N] format
 
-Ejemplo Windows:
-    python microfs.py \\\\.\\PhysicalDrive2 list
-    python microfs.py \\\\.\\PhysicalDrive2 import TEST.TXT C:\\datos\\test.txt
-    
-Ejemplo Linux:
-    python microfs.py /dev/sdc list
+Ejemplos:
+    python microfs.py sd.img list
+    python microfs.py sd.img --offset 1048576 export HELLO.TXT C:\\datos\\hello.txt
+    python microfs.py \\\\.\\PhysicalDrive2 list          (Windows, requiere administrador)
+    python microfs.py /dev/sdb list                       (Linux, requiere root)
+
+Nota: sobre un disco fisico en Windows solo se puede montar sin escribir; para escribir,
+desmonta la unidad (quita la letra) o trabaja con una imagen .img.
 """
 
-import sys
+import argparse
 import struct
-import os
+import sys
 
-MFS_MAGIC = 0x4D46      # "MF"
 MFS_MAX_FILES = 16
 MFS_NAME_LEN = 12
+MAX_NAME_LEN = MFS_NAME_LEN - 1
 SECTOR_SIZE = 512
+TABLE_OFFSET = 16
+ENTRY_SIZE = 32
+MAX_ENTRIES = (SECTOR_SIZE - TABLE_OFFSET) // ENTRY_SIZE  # 15: la 16a no cabe en el sector
+MAX_FILE_SIZE = 65535
+
 
 class MicroFS:
-    def __init__(self, device):
-        self.device = device
-        self.files = []
-        self.num_files = 0
+    def __init__(self, image, offset=0, writable=False):
+        self.image = image
+        self.offset = offset
+        self.writable = writable
+        self.files = []          # lista de dicts en memoria
         self.next_sector = 1
-        
-    def open_device(self, mode='rb'):
-        """Abrir dispositivo SD"""
-        return open(self.device, mode + 'b', buffering=0)
-    
-    def read_sector(self, sector):
-        """Leer un sector"""
-        with self.open_device('r') as f:
-            f.seek(sector * SECTOR_SIZE)
-            return f.read(SECTOR_SIZE)
-    
-    def write_sector(self, sector, data):
-        """Escribir un sector"""
-        if len(data) < SECTOR_SIZE:
-            data = data + bytes(SECTOR_SIZE - len(data))
-        with self.open_device('r+') as f:
-            f.seek(sector * SECTOR_SIZE)
-            f.write(data[:SECTOR_SIZE])
-    
-    def load_superblock(self):
-        """Cargar superbloque"""
-        data = self.read_sector(0)
-        
-        magic, version, num_files, next_sector = struct.unpack('<HHHH', data[:8])
-        
-        if magic != MFS_MAGIC:
-            raise ValueError("No es un sistema MicroFS válido")
-        
-        self.num_files = num_files
-        self.next_sector = next_sector
+        self.table = bytearray(SECTOR_SIZE)
+
+    # ---------- E/S ----------
+    def _open(self, mode):
+        return open(self.image, mode, buffering=0)
+
+    def _read(self, pos, size):
+        with self._open('rb') as f:
+            f.seek(pos)
+            data = f.read(size)
+        if len(data) < size:
+            data += bytes(size - len(data))
+        return data
+
+    def _write(self, pos, data):
+        if not self.writable:
+            raise PermissionError("modo lectura")
+        with self._open('r+b') as f:
+            f.seek(pos)
+            f.write(data)
+
+    def _sector_pos(self, sector):
+        return self.offset + sector * SECTOR_SIZE
+
+    # ---------- superbloque ----------
+    def load(self):
+        self.table = bytearray(self._read(self.offset, SECTOR_SIZE))
+        if bytes(self.table[0:2]) not in (b'FM', b'MF'):
+            raise ValueError(
+                "No se encontro MicroFS (firma 0x%02X 0x%02X, se esperaba 'FM') en el offset %d"
+                % (self.table[0], self.table[1], self.offset))
+        self.next_sector = struct.unpack_from('<H', self.table, 6)[0]
         self.files = []
-        
-        # Leer entradas (offset 16, 32 bytes cada una)
-        for i in range(MFS_MAX_FILES):
-            offset = 16 + i * 32
-            entry_data = data[offset:offset+32]
-            
-            name = entry_data[:MFS_NAME_LEN].rstrip(b'\x00').decode('ascii', errors='ignore')
-            start_sector, size, sectors, flags = struct.unpack('<HHHB', entry_data[12:19])
-            
+        for i in range(MAX_ENTRIES):
+            base = TABLE_OFFSET + i * ENTRY_SIZE
+            if self.table[base] == 0:
+                continue
+            raw_name = bytes(self.table[base:base + MFS_NAME_LEN])
+            name = raw_name.split(b'\x00')[0].decode('ascii', errors='replace')
+            start, size, sectors = struct.unpack_from('<HHH', self.table, base + 12)
             self.files.append({
-                'name': name,
-                'start_sector': start_sector,
-                'size': size,
-                'sectors': sectors,
-                'flags': flags
+                'slot': i, 'name': name, 'start': start,
+                'size': size, 'sectors': sectors,
             })
-    
-    def save_superblock(self):
-        """Guardar superbloque"""
-        data = bytearray(SECTOR_SIZE)
-        
-        # Header
-        struct.pack_into('<HHHH', data, 0, MFS_MAGIC, 1, self.num_files, self.next_sector)
-        
-        # Entradas
-        for i, f in enumerate(self.files):
-            offset = 16 + i * 32
-            name_bytes = f['name'].encode('ascii')[:MFS_NAME_LEN-1].ljust(MFS_NAME_LEN, b'\x00')
-            data[offset:offset+MFS_NAME_LEN] = name_bytes
-            struct.pack_into('<HHHB', data, offset+12, 
-                           f['start_sector'], f['size'], f['sectors'], f['flags'])
-        
-        self.write_sector(0, bytes(data))
-    
-    def format(self):
-        """Formatear SD con MicroFS"""
-        self.num_files = 0
-        self.next_sector = 1
-        self.files = [{'name': '', 'start_sector': 0, 'size': 0, 'sectors': 0, 'flags': 0} 
-                      for _ in range(MFS_MAX_FILES)]
-        self.save_superblock()
-        print("SD formateada con MicroFS")
-    
-    def list_files(self):
-        """Listar archivos"""
-        self.load_superblock()
-        
-        print(f"\nMicroFS - {self.num_files} archivo(s)")
-        print("-" * 40)
-        
-        for i, f in enumerate(self.files):
-            if f['name']:
-                print(f"  {i:2d}: {f['name']:12s}  {f['size']:6d} bytes  (sector {f['start_sector']})")
-        
-        print("-" * 40)
-        print(f"Próximo sector libre: {self.next_sector}")
-    
-    def find_file(self, name):
-        """Buscar archivo por nombre"""
+        return self
+
+    def save(self):
+        self.table[0:2] = b'FM'
+        struct.pack_into('<H', self.table, 6, self.next_sector)
+        for i in range(MAX_ENTRIES):
+            base = TABLE_OFFSET + i * ENTRY_SIZE
+            self.table[base:base + ENTRY_SIZE] = bytes(ENTRY_SIZE)
+        for f in self.files:
+            base = TABLE_OFFSET + f['slot'] * ENTRY_SIZE
+            name = f['name'].encode('ascii')[:MAX_NAME_LEN]
+            self.table[base:base + len(name)] = name
+            struct.pack_into('<HHH', self.table, base + 12,
+                             f['start'], f['size'], f['sectors'])
+        self._write(self.offset, bytes(self.table))
+
+    # ---------- operaciones ----------
+    def find(self, name):
         name = name.upper()
-        for i, f in enumerate(self.files):
+        for f in self.files:
             if f['name'].upper() == name:
-                return i
-        return -1
-    
+                return f
+        return None
+
     def read_file(self, name):
-        """Leer contenido de archivo"""
-        self.load_superblock()
-        
-        idx = self.find_file(name)
-        if idx < 0:
-            print(f"Error: Archivo '{name}' no encontrado")
+        f = self.find(name)
+        if f is None:
             return None
-        
-        f = self.files[idx]
-        data = bytearray()
-        
-        for s in range(f['sectors']):
-            sector_data = self.read_sector(f['start_sector'] + s)
-            data.extend(sector_data)
-        
-        return bytes(data[:f['size']])
-    
-    def write_file(self, name, content):
-        """Escribir/crear archivo"""
-        self.load_superblock()
-        
-        if isinstance(content, str):
-            content = content.encode('utf-8')
-        
-        idx = self.find_file(name)
-        
-        if idx >= 0:
-            # Archivo existe - verificar que cabe
-            f = self.files[idx]
-            if len(content) > f['sectors'] * SECTOR_SIZE:
-                print(f"Error: Contenido muy grande para el archivo existente")
-                return False
-            
-            # Escribir datos
-            for s in range(f['sectors']):
-                start = s * SECTOR_SIZE
-                end = start + SECTOR_SIZE
-                sector_data = content[start:end] if start < len(content) else b''
-                self.write_sector(f['start_sector'] + s, sector_data)
-            
-            # Actualizar tamaño
-            f['size'] = len(content)
-            self.save_superblock()
-            print(f"Archivo '{name}' actualizado ({len(content)} bytes)")
-            
-        else:
-            # Crear nuevo archivo
-            slot = -1
-            for i, f in enumerate(self.files):
-                if not f['name']:
-                    slot = i
-                    break
-            
-            if slot < 0:
-                print("Error: No hay espacio para más archivos")
-                return False
-            
-            sectors = (len(content) + SECTOR_SIZE - 1) // SECTOR_SIZE
-            if sectors == 0:
-                sectors = 1
-            
-            # Escribir datos
-            for s in range(sectors):
-                start = s * SECTOR_SIZE
-                end = start + SECTOR_SIZE
-                sector_data = content[start:end] if start < len(content) else b''
-                self.write_sector(self.next_sector + s, sector_data)
-            
-            # Crear entrada
-            self.files[slot] = {
-                'name': name.upper()[:MFS_NAME_LEN-1],
-                'start_sector': self.next_sector,
-                'size': len(content),
-                'sectors': sectors,
-                'flags': 0
-            }
-            
-            self.next_sector += sectors
-            self.num_files += 1
-            self.save_superblock()
-            print(f"Archivo '{name}' creado ({len(content)} bytes, {sectors} sector(es))")
-        
-        return True
-    
-    def delete_file(self, name):
-        """Eliminar archivo"""
-        self.load_superblock()
-        
-        idx = self.find_file(name)
-        if idx < 0:
-            print(f"Error: Archivo '{name}' no encontrado")
+        return self._read(self._sector_pos(f['start']), f['size'])
+
+    def write_file(self, name, data):
+        name = name.upper()[:MAX_NAME_LEN]
+        if len(data) > MAX_FILE_SIZE:
+            raise ValueError("El archivo supera %d bytes" % MAX_FILE_SIZE)
+        sectors = max(1, (len(data) + SECTOR_SIZE - 1) // SECTOR_SIZE)
+
+        existing = self.find(name)
+        if existing is not None:
+            if sectors <= existing['sectors']:
+                self._write_sectors(existing['start'], existing['sectors'], data)
+                existing['size'] = len(data)
+                self.save()
+                return
+
+        # Reasignacion: compacta todos los archivos en orden, como mfs_create.
+        entries = [(f['name'], data if f['name'].upper() == name else
+                    self._read(self._sector_pos(f['start']), f['size']))
+                   for f in self.files]
+        if not any(n.upper() == name for n, _ in entries):
+            entries.append((name, data))
+        if len(entries) > MAX_ENTRIES:
+            raise ValueError("No hay espacio para mas archivos (maximo %d reales)" % MAX_ENTRIES)
+
+        sector = 1
+        self.files = []
+        for i, (n, content) in enumerate(entries):
+            nsec = max(1, (len(content) + SECTOR_SIZE - 1) // SECTOR_SIZE)
+            self._write_sectors(sector, nsec, content)
+            self.files.append({'slot': i, 'name': n, 'start': sector,
+                               'size': len(content), 'sectors': nsec})
+            sector += nsec
+        self.next_sector = sector
+        self.save()
+
+    def _write_sectors(self, start, sectors, content):
+        for s in range(sectors):
+            start_off = s * SECTOR_SIZE
+            chunk = content[start_off:start_off + SECTOR_SIZE]
+            self._write(self._sector_pos(start + s), chunk.ljust(SECTOR_SIZE, b'\x00'))
+
+    def delete(self, name):
+        f = self.find(name)
+        if f is None:
             return False
-        
-        self.files[idx] = {'name': '', 'start_sector': 0, 'size': 0, 'sectors': 0, 'flags': 0}
-        self.num_files -= 1
-        self.save_superblock()
-        print(f"Archivo '{name}' eliminado")
+        self.files.remove(f)
+        self.save()
         return True
-    
-    def import_file(self, mfs_name, local_path):
-        """Importar archivo desde PC"""
-        with open(local_path, 'rb') as f:
-            content = f.read()
-        return self.write_file(mfs_name, content)
-    
-    def export_file(self, mfs_name, local_path):
-        """Exportar archivo a PC"""
-        content = self.read_file(mfs_name)
-        if content is None:
-            return False
-        with open(local_path, 'wb') as f:
-            f.write(content)
-        print(f"Exportado a '{local_path}'")
-        return True
+
+    def rename(self, old_name, new_name):
+        """Cambia el nombre sin mover los datos ni modificar la reserva."""
+        f = self.find(old_name)
+        if f is None:
+            raise ValueError("Archivo no encontrado: %s" % old_name)
+        new_name = new_name.upper()
+        if not new_name:
+            raise ValueError("El nombre no puede estar vacio")
+        if len(new_name) > MAX_NAME_LEN:
+            raise ValueError("El nombre no puede superar %d caracteres" % MAX_NAME_LEN)
+        if any(c < ' ' or c > '~' for c in new_name):
+            raise ValueError("El nombre solo admite ASCII imprimible")
+        other = self.find(new_name)
+        if other is not None and other is not f:
+            raise ValueError("Ya existe un archivo llamado %s" % new_name)
+        f['name'] = new_name
+        self.save()
+
+    def format(self):
+        self.files = []
+        self.next_sector = 1
+        self.table = bytearray(SECTOR_SIZE)
+        self.save()
+
+    def free_sectors(self):
+        import os
+        try:
+            total = (os.path.getsize(self.image) - self.offset) // SECTOR_SIZE
+        except OSError:
+            return None
+        return max(0, total - self.next_sector)
 
 
 def main():
-    if len(sys.argv) < 3:
-        print(__doc__)
-        sys.exit(1)
-    
-    device = sys.argv[1]
-    command = sys.argv[2].lower()
-    
-    mfs = MicroFS(device)
-    
+    parser = argparse.ArgumentParser(
+        description="Herramienta para el sistema de archivos MicroFS (microfs-6502-cc65)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__)
+    parser.add_argument('image', help="archivo de imagen, \\\\.\\PhysicalDriveN o /dev/sdX")
+    parser.add_argument('--offset', type=lambda x: int(x, 0), default=0,
+                        help="offset en bytes del sector 0 (por defecto 0; 0x100000 si la "
+                             "imagen conserva la tabla de particiones)")
+    parser.add_argument('command', choices=['list', 'read', 'export', 'import', 'delete', 'rename', 'format'])
+    parser.add_argument('name', nargs='?', help="nombre del archivo MicroFS")
+    parser.add_argument('local', nargs='?', help="archivo local (segundo argumento)")
+    args = parser.parse_args()
+
+    writable = args.command in ('import', 'delete', 'rename', 'format')
     try:
-        if command == 'format':
-            mfs.format()
-            
-        elif command == 'list':
-            mfs.list_files()
-            
-        elif command == 'read':
-            if len(sys.argv) < 4:
-                print("Uso: microfs.py <dev> read <archivo>")
-                sys.exit(1)
-            content = mfs.read_file(sys.argv[3])
-            if content:
-                print(content.decode('utf-8', errors='replace'))
-                
-        elif command == 'write':
-            if len(sys.argv) < 4:
-                print("Uso: microfs.py <dev> write <archivo> [contenido]")
-                sys.exit(1)
-            content = ' '.join(sys.argv[4:]) if len(sys.argv) > 4 else ''
-            mfs.write_file(sys.argv[3], content)
-            
-        elif command == 'delete':
-            if len(sys.argv) < 4:
-                print("Uso: microfs.py <dev> delete <archivo>")
-                sys.exit(1)
-            mfs.delete_file(sys.argv[3])
-            
-        elif command == 'import':
-            if len(sys.argv) < 5:
-                print("Uso: microfs.py <dev> import <nombre_mfs> <archivo_local>")
-                sys.exit(1)
-            mfs.import_file(sys.argv[3], sys.argv[4])
-            
-        elif command == 'export':
-            if len(sys.argv) < 5:
-                print("Uso: microfs.py <dev> export <nombre_mfs> <archivo_local>")
-                sys.exit(1)
-            mfs.export_file(sys.argv[3], sys.argv[4])
-            
-        else:
-            print(f"Comando desconocido: {command}")
-            print(__doc__)
-            sys.exit(1)
-            
+        fs = MicroFS(args.image, args.offset, writable=writable).load()
+
+        if args.command == 'list':
+            free = fs.free_sectors()
+            print("\nMicroFS: %d archivo(s), proximo sector libre %d%s"
+                  % (len(fs.files), fs.next_sector,
+                     "" if free is None else ", %d sectores libres" % free))
+            print("-" * 62)
+            print("%-12s %8s %10s %7s" % ("NOMBRE", "TAMANO", "RESERVADO", "SECTOR"))
+            for f in fs.files:
+                print("%-12s %8d %10d %7d"
+                      % (f['name'], f['size'], f['sectors'] * SECTOR_SIZE, f['start']))
+            print("-" * 62)
+
+        elif args.command == 'read':
+            data = fs.read_file(args.name or "")
+            if data is None:
+                sys.exit("Archivo no encontrado: %s" % args.name)
+            sys.stdout.buffer.write(data)
+
+        elif args.command == 'export':
+            data = fs.read_file(args.name or "")
+            if data is None:
+                sys.exit("Archivo no encontrado: %s" % args.name)
+            with open(args.local, 'wb') as f:
+                f.write(data)
+            print("Exportado %s (%d bytes) a %s" % (args.name, len(data), args.local))
+
+        elif args.command == 'import':
+            with open(args.local, 'rb') as f:
+                data = f.read()
+            fs.write_file(args.name, data)
+            print("Importado %s (%d bytes) como %s" % (args.local, len(data), args.name.upper()))
+
+        elif args.command == 'delete':
+            if not fs.delete(args.name or ""):
+                sys.exit("Archivo no encontrado: %s" % args.name)
+            print("Eliminado %s" % args.name)
+
+        elif args.command == 'rename':
+            if args.local is None:
+                sys.exit("Uso: microfs.py <imagen> rename <nombre_actual> <nombre_nuevo>")
+            fs.rename(args.name or "", args.local)
+            print("Renombrado %s -> %s" % (args.name.upper(), args.local.upper()))
+
+        elif args.command == 'format':
+            fs.format()
+            print("Medio formateado con MicroFS")
+
     except PermissionError:
-        print(f"Error: Sin permisos para acceder a {device}")
-        print("En Windows, ejecuta como Administrador")
-        print("En Linux, usa sudo o agrega tu usuario al grupo 'disk'")
-        sys.exit(1)
+        sys.exit("Sin permisos para escribir en %s.\n"
+                 "Windows: ejecuta como Administrador y quita la letra de unidad a la SD.\n"
+                 "Linux: usa sudo." % args.image)
     except FileNotFoundError:
-        print(f"Error: Dispositivo {device} no encontrado")
-        sys.exit(1)
+        sys.exit("No se encontro %s" % args.image)
     except ValueError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
+        sys.exit("Error: %s" % e)
 
 
 if __name__ == '__main__':

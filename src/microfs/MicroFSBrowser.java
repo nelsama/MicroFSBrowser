@@ -1,1064 +1,1235 @@
 package microfs;
 
 import javax.swing.*;
-import javax.swing.table.*;
 import javax.swing.border.*;
+import javax.swing.filechooser.FileNameExtensionFilter;
+import javax.swing.table.*;
 import java.awt.*;
-import java.awt.event.*;
-import java.io.*;
-import java.nio.file.*;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.prefs.Preferences;
 
 /**
- * MicroFS Browser - Navegador gráfico para sistema de archivos MicroFS
- * 
- * @author MicroFS Tools
- * @version 1.0
+ * MicroFS Browser - Navegador gráfico del sistema de archivos MicroFS.
+ *
+ * Trabaja con una imagen de tarjeta SD (.img / .bin) o, si el sistema lo permite, con un
+ * dispositivo físico (Windows: \\.\PhysicalDriveN; Linux: /dev/sdX). El formato es el del
+ * driver microfs-6502-cc65.
+ *
+ * Los cambios se aplican primero en memoria; el botón Guardar escribe la tabla y los datos
+ * en el medio, lo que permite deshacer operaciones antes de confirmarlas.
  */
 public class MicroFSBrowser extends JFrame {
-    
+
     private static final long serialVersionUID = 1L;
-    
-    // Constantes MicroFS
-    private static final int MFS_MAGIC = 0x4D46;      // "MF"
-    private static final int MFS_MAX_FILES = 16;      // 16 entradas * 32 bytes = 512 - 16 header
-    private static final int MFS_NAME_LEN = 12;
-    private static final int SECTOR_SIZE = 512;
-    
-    // Componentes UI
+
+    private static final String[] IMAGE_FILTER = {"img", "bin", "dsk", "raw"};
+    private static final String BACKUP_PREF = "carpetaCopiasSeguridad";
+    private static final String LAST_FOLDER_PREF = "ultimaCarpeta";
+
+    private File backupChooser;
+    private boolean backupsDisabled;
+    private final SimpleDateFormat backupFormat = new SimpleDateFormat("yyyyMMdd-HHmmss");
+
+    // Componentes de conexión
     private JTextField deviceField;
+    private JTextField baseOffsetField;
+    private JComboBox<DiskItem> diskComboBox;
+    private JButton detectButton;
+    private JButton openImageButton;
+    private JButton newImageButton;
+    private JButton connectButton;
+    private JButton disconnectButton;
+    private JButton formatButton;
+    private JButton saveButton;
+    private JButton undoButton;
+
+    // Datos
     private JTable fileTable;
     private DefaultTableModel tableModel;
+    private JCheckBox hexViewCheck;
     private JTextArea contentArea;
     private JTextArea logArea;
     private JLabel statusLabel;
-    private JButton connectButton;
-    private JButton formatButton;
-    private JButton refreshButton;
-    private JButton readButton;
-    private JButton writeButton;
+    private JButton viewButton;
+    private JButton editButton;
     private JButton deleteButton;
     private JButton importButton;
     private JButton exportButton;
-    private JButton detectDisksButton;
-    private JComboBox<String> diskComboBox;
-    
-    // Estado
-    private String currentDevice = "";
-    private boolean connected = false;
-    private List<MFSFileEntry> files = new ArrayList<>();
-    private int numFiles = 0;
-    private int nextSector = 1;
-    
-    /**
-     * Entrada de archivo MicroFS
-     */
-    private static class MFSFileEntry {
-        String name;
-        int startSector;
-        int size;
-        int sectors;
-        int flags;
-        
-        MFSFileEntry() {
-            this.name = "";
-            this.startSector = 0;
-            this.size = 0;
-            this.sectors = 0;
-            this.flags = 0;
+    private JButton renameButton;
+
+    private final MicroFSManager fs = new MicroFSManager();
+    private final WriteJournal journal = new WriteJournal();
+    private final List<String> rowNames = new ArrayList<>();
+    private boolean dirty;
+    private boolean selectingFromCode;
+
+    private static final class DiskItem {
+        final String label;
+        final String path;
+        final int score;
+
+        DiskItem(String label, String path) {
+            this(label, path, 0);
         }
-        
-        MFSFileEntry(String name, int startSector, int size, int sectors, int flags) {
-            this.name = name;
-            this.startSector = startSector;
-            this.size = size;
-            this.sectors = sectors;
-            this.flags = flags;
+
+        DiskItem(String label, String path, int score) {
+            this.label = label;
+            this.path = path;
+            this.score = score;
         }
+
+        @Override
+        public String toString() { return label; }
     }
-    
+
     public MicroFSBrowser() {
-        super("MicroFS Browser v1.0");
-        initializeUI();
-        setupEventHandlers();
-        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        setSize(900, 700);
+        super("MicroFS Browser v2.0");
+        buildUi();
+        bindEvents();
+        setDefaultCloseOperation(DO_NOTHING_ON_CLOSE);
+        addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override
+            public void windowClosing(java.awt.event.WindowEvent e) {
+                if (confirmDiscard()) dispose();
+            }
+        });
+        setSize(1080, 740);
+        setMinimumSize(new Dimension(860, 580));
         setLocationRelativeTo(null);
-        setMinimumSize(new Dimension(800, 600));
+        refreshTable();
     }
-    
-    private void initializeUI() {
-        // Look and Feel del sistema
+
+    private void initLookAndFeel() {
         try {
             UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
-        } catch (Exception e) {
-            // Usar L&F por defecto
+        } catch (Exception ignored) {
+            // L&F por defecto
         }
-        
-        setLayout(new BorderLayout(5, 5));
-        
-        // Panel superior - Conexión
-        JPanel topPanel = createConnectionPanel();
-        add(topPanel, BorderLayout.NORTH);
-        
-        // Panel central - Split entre tabla y contenido
-        JSplitPane centerSplit = createCenterPanel();
-        add(centerSplit, BorderLayout.CENTER);
-        
-        // Panel inferior - Log y estado
-        JPanel bottomPanel = createBottomPanel();
-        add(bottomPanel, BorderLayout.SOUTH);
-        
-        // Borde general
-        ((JPanel)getContentPane()).setBorder(new EmptyBorder(10, 10, 10, 10));
-        
-        updateButtonStates();
     }
-    
+
+    // ==================== Construcción de la UI ====================
+
+    private void buildUi() {
+        initLookAndFeel();
+        setLayout(new BorderLayout(6, 6));
+        add(createConnectionPanel(), BorderLayout.NORTH);
+        add(createMainSplit(), BorderLayout.CENTER);
+        add(createLogPanel(), BorderLayout.SOUTH);
+        ((JPanel) getContentPane()).setBorder(new EmptyBorder(8, 8, 8, 8));
+    }
+
     private JPanel createConnectionPanel() {
-        JPanel panel = new JPanel(new BorderLayout(10, 5));
-        panel.setBorder(new TitledBorder("Dispositivo SD"));
-        
-        // Panel superior - Detección de discos
-        JPanel diskDetectPanel = new JPanel(new BorderLayout(5, 0));
-        diskDetectPanel.add(new JLabel("Discos detectados: "), BorderLayout.WEST);
+        JPanel panel = new JPanel(new BorderLayout(6, 6));
+        panel.setBorder(new TitledBorder("1. Medio"));
+
+        JPanel diskRow = new JPanel(new BorderLayout(5, 0));
         diskComboBox = new JComboBox<>();
-        diskComboBox.setPreferredSize(new Dimension(400, 25));
-        diskDetectPanel.add(diskComboBox, BorderLayout.CENTER);
-        detectDisksButton = new JButton("Detectar Discos");
-        diskDetectPanel.add(detectDisksButton, BorderLayout.EAST);
-        
-        // Panel inferior - Campo manual y botones
-        JPanel devicePanel = new JPanel(new BorderLayout(5, 0));
-        devicePanel.add(new JLabel("Dispositivo: "), BorderLayout.WEST);
-        deviceField = new JTextField("\\\\.\\PhysicalDrive2");
-        deviceField.setToolTipText("Ej: \\\\.\\PhysicalDrive2 (Windows) o /dev/sdc (Linux)");
-        devicePanel.add(deviceField, BorderLayout.CENTER);
-        
-        // Botones de conexión
-        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
-        connectButton = new JButton("Conectar");
+        diskComboBox.setPreferredSize(new Dimension(560, 26));
+        detectButton = new JButton("Detectar discos");
+        diskRow.add(new JLabel("Discos SD/USB:"), BorderLayout.WEST);
+        diskRow.add(diskComboBox, BorderLayout.CENTER);
+        diskRow.add(detectButton, BorderLayout.EAST);
+
+        JPanel pathRow = new JPanel(new BorderLayout(5, 0));
+        deviceField = new JTextField();
+        deviceField.setToolTipText("Imagen: C:\\imagenes\\sd.img    Windows: \\\\.\\PhysicalDrive3    Linux: /dev/sdb");
+        pathRow.add(new JLabel("Imagen o dispositivo:"), BorderLayout.WEST);
+        pathRow.add(deviceField, BorderLayout.CENTER);
+        JPanel pathButtons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 5, 0));
+        openImageButton = new JButton("Abrir imagen…");
+        newImageButton = new JButton("Crear imagen…");
+        pathButtons.add(openImageButton);
+        pathButtons.add(newImageButton);
+        pathRow.add(pathButtons, BorderLayout.EAST);
+
+        JPanel offsetRow = new JPanel(new BorderLayout(5, 0));
+        baseOffsetField = new JTextField("0", 12);
+        baseOffsetField.setHorizontalAlignment(JTextField.RIGHT);
+        baseOffsetField.setToolTipText("Offset del sector 0 de MicroFS dentro de la imagen. " +
+                "Si la imagen conserva la tabla de particiones, MicroFS suele empezar en 1048576.");
+        JPanel offsetButtons = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        JButton detectOffset = new JButton("Detectar offset");
+        offsetButtons.add(baseOffsetField);
+        offsetButtons.add(detectOffset);
+        offsetButtons.add(Box.createHorizontalStrut(12));
+        connectButton = new JButton("Abrir MicroFS");
+        disconnectButton = new JButton("Cerrar");
         formatButton = new JButton("Formatear");
-        refreshButton = new JButton("Actualizar");
-        
-        buttonPanel.add(connectButton);
-        buttonPanel.add(formatButton);
-        buttonPanel.add(refreshButton);
-        
-        devicePanel.add(buttonPanel, BorderLayout.EAST);
-        
-        // Combinar paneles
-        JPanel topContent = new JPanel(new GridLayout(2, 1, 5, 5));
-        topContent.add(diskDetectPanel);
-        topContent.add(devicePanel);
-        
-        panel.add(topContent, BorderLayout.CENTER);
-        
+        saveButton = new JButton("Guardar cambios");
+        undoButton = new JButton("Deshacer");
+        offsetButtons.add(connectButton);
+        offsetButtons.add(disconnectButton);
+        offsetButtons.add(formatButton);
+        offsetButtons.add(saveButton);
+        offsetButtons.add(undoButton);
+        offsetRow.add(new JLabel("Sector 0 en offset:"), BorderLayout.WEST);
+        offsetRow.add(offsetButtons, BorderLayout.CENTER);
+
+        detectOffset.addActionListener(e -> detectBaseOffset());
+
+        JPanel rows = new JPanel(new GridLayout(3, 1, 4, 4));
+        rows.add(diskRow);
+        rows.add(pathRow);
+        rows.add(offsetRow);
+        panel.add(rows, BorderLayout.CENTER);
         return panel;
     }
-    
-    private JSplitPane createCenterPanel() {
-        // Panel izquierdo - Lista de archivos
-        JPanel fileListPanel = new JPanel(new BorderLayout(5, 5));
-        fileListPanel.setBorder(new TitledBorder("Archivos MicroFS"));
-        
-        // Tabla de archivos
-        String[] columns = {"#", "Nombre", "Tamaño", "Sectores", "Sector Inicio"};
+
+    private JSplitPane createMainSplit() {
+        JPanel filesPanel = new JPanel(new BorderLayout(5, 5));
+        filesPanel.setBorder(new TitledBorder("2. Archivos"));
+
+        String[] columns = {"Nombre", "Tamaño", "Reservado", "Libre", "Sector"};
         tableModel = new DefaultTableModel(columns, 0) {
+            private static final long serialVersionUID = 1L;
+
             @Override
-            public boolean isCellEditable(int row, int column) {
-                return false;
-            }
+            public boolean isCellEditable(int row, int column) { return false; }
         };
         fileTable = new JTable(tableModel);
         fileTable.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        fileTable.getColumnModel().getColumn(0).setPreferredWidth(30);
-        fileTable.getColumnModel().getColumn(1).setPreferredWidth(120);
-        fileTable.getColumnModel().getColumn(2).setPreferredWidth(80);
-        fileTable.getColumnModel().getColumn(3).setPreferredWidth(60);
-        fileTable.getColumnModel().getColumn(4).setPreferredWidth(80);
-        
-        JScrollPane tableScroll = new JScrollPane(fileTable);
-        fileListPanel.add(tableScroll, BorderLayout.CENTER);
-        
-        // Botones de operaciones
-        JPanel opButtonPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 5, 5));
-        readButton = new JButton("Leer");
-        writeButton = new JButton("Escribir");
+        fileTable.setAutoCreateRowSorter(true);
+        int[] widths = {130, 80, 90, 70, 60};
+        for (int i = 0; i < widths.length; i++) {
+            fileTable.getColumnModel().getColumn(i).setPreferredWidth(widths[i]);
+        }
+        filesPanel.add(new JScrollPane(fileTable), BorderLayout.CENTER);
+
+        JPanel buttons = new JPanel(new FlowLayout(FlowLayout.CENTER, 4, 4));
+        viewButton = new JButton("Ver");
+        editButton = new JButton("Editar texto");
         deleteButton = new JButton("Eliminar");
+        renameButton = new JButton("Renombrar");
+        renameButton.setToolTipText("Cambiar el nombre sin mover el archivo (F2)");
         importButton = new JButton("PC → SD");
         exportButton = new JButton("SD → PC");
-        
-        opButtonPanel.add(readButton);
-        opButtonPanel.add(writeButton);
-        opButtonPanel.add(deleteButton);
-        opButtonPanel.add(new JSeparator(SwingConstants.VERTICAL));
-        opButtonPanel.add(importButton);
-        opButtonPanel.add(exportButton);
-        
-        fileListPanel.add(opButtonPanel, BorderLayout.SOUTH);
-        
-        // Panel derecho - Contenido del archivo
+        buttons.add(viewButton);
+        buttons.add(editButton);
+        buttons.add(renameButton);
+        buttons.add(deleteButton);
+        buttons.add(importButton);
+        buttons.add(exportButton);
+        filesPanel.add(buttons, BorderLayout.SOUTH);
+
         JPanel contentPanel = new JPanel(new BorderLayout(5, 5));
-        contentPanel.setBorder(new TitledBorder("Contenido del Archivo"));
-        
+        contentPanel.setBorder(new TitledBorder("Contenido"));
+        JPanel viewOptions = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 2));
+        hexViewCheck = new JCheckBox("Vista hexadecimal");
+        viewOptions.add(hexViewCheck);
+        contentPanel.add(viewOptions, BorderLayout.NORTH);
+
         contentArea = new JTextArea();
         contentArea.setFont(new Font("Monospaced", Font.PLAIN, 12));
         contentArea.setLineWrap(true);
-        contentArea.setWrapStyleWord(true);
-        JScrollPane contentScroll = new JScrollPane(contentArea);
-        contentPanel.add(contentScroll, BorderLayout.CENTER);
-        
-        // Vista hexadecimal checkbox
-        JPanel viewPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        JCheckBox hexCheck = new JCheckBox("Vista Hexadecimal");
-        viewPanel.add(hexCheck);
-        contentPanel.add(viewPanel, BorderLayout.NORTH);
-        
-        // Split pane
-        JSplitPane splitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, 
-                                               fileListPanel, contentPanel);
-        splitPane.setDividerLocation(400);
-        splitPane.setResizeWeight(0.5);
-        
-        return splitPane;
+        contentArea.setWrapStyleWord(false);
+        contentArea.setEditable(false);
+        contentPanel.add(new JScrollPane(contentArea), BorderLayout.CENTER);
+
+        JSplitPane split = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT, filesPanel, contentPanel);
+        split.setDividerLocation(460);
+        split.setResizeWeight(0.45);
+        return split;
     }
-    
-    private JPanel createBottomPanel() {
+
+    private JPanel createLogPanel() {
         JPanel panel = new JPanel(new BorderLayout(5, 5));
-        
-        // Log
         JPanel logPanel = new JPanel(new BorderLayout());
         logPanel.setBorder(new TitledBorder("Log"));
-        logArea = new JTextArea(4, 50);
+        logArea = new JTextArea(5, 60);
         logArea.setEditable(false);
         logArea.setFont(new Font("Monospaced", Font.PLAIN, 11));
-        JScrollPane logScroll = new JScrollPane(logArea);
-        logPanel.add(logScroll, BorderLayout.CENTER);
-        
-        // Barra de estado
-        statusLabel = new JLabel("Desconectado");
+        logPanel.add(new JScrollPane(logArea), BorderLayout.CENTER);
+
+        statusLabel = new JLabel(" ");
         statusLabel.setBorder(new BevelBorder(BevelBorder.LOWERED));
-        
         panel.add(logPanel, BorderLayout.CENTER);
         panel.add(statusLabel, BorderLayout.SOUTH);
-        
         return panel;
     }
-    
-    private Icon createIcon(String emoji) {
-        // Crear icono simple con texto
-        return null; // Los iconos emoji no funcionan bien en todos los sistemas
-    }
-    
-    private void setupEventHandlers() {
-        connectButton.addActionListener(e -> connectToDevice());
-        formatButton.addActionListener(e -> formatDevice());
-        refreshButton.addActionListener(e -> refreshFileList());
-        readButton.addActionListener(e -> readSelectedFile());
-        writeButton.addActionListener(e -> writeFile());
-        deleteButton.addActionListener(e -> deleteSelectedFile());
-        importButton.addActionListener(e -> importFile());
-        exportButton.addActionListener(e -> exportFile());
-        detectDisksButton.addActionListener(e -> detectPhysicalDisks());
-        
-        // Cuando se selecciona un disco del combo, actualizar el campo de texto
+
+    // ==================== Eventos ====================
+
+    private void bindEvents() {
+        detectButton.addActionListener(e -> detectDisks());
+        openImageButton.addActionListener(e -> chooseExistingImage());
+        newImageButton.addActionListener(e -> createNewImage());
+        connectButton.addActionListener(e -> openMedium());
+        disconnectButton.addActionListener(e -> {
+            if (!preparePendingEdits()) return;
+            if (confirmDiscard()) {
+                fs.close();
+                dirty = false;
+                journal.clear();
+                contentArea.setText("");
+                contentArea.setEditable(false);
+                editButton.setText("Editar texto");
+                refreshTable();
+                log("Medio cerrado");
+            }
+        });
+        formatButton.addActionListener(e -> formatMedium());
+        saveButton.addActionListener(e -> saveChanges());
+        undoButton.addActionListener(e -> undoChanges());
+        viewButton.addActionListener(e -> viewSelected());
+        editButton.addActionListener(e -> toggleEdit());
+        deleteButton.addActionListener(e -> deleteSelected());
+        importButton.addActionListener(e -> importFiles());
+        exportButton.addActionListener(e -> exportSelected());
+        renameButton.addActionListener(e -> renameSelected());
+        hexViewCheck.addActionListener(e -> {
+            if (fileTable.getSelectedRow() >= 0) viewSelected();
+        });
+
         diskComboBox.addActionListener(e -> {
-            if (diskComboBox.getSelectedItem() != null) {
-                String selected = (String) diskComboBox.getSelectedItem();
-                // Formato: "F: - Label (X GB) [Type]|DiskNum|DriveLetter"
-                String[] parts = selected.split("\\|");
-                if (parts.length >= 2) {
-                    String diskNumber = parts[1].trim();
-                    // Usar PhysicalDrive para escritura directa (evita "El parámetro no es correcto")
-                    deviceField.setText("\\\\.\\PhysicalDrive" + diskNumber);
-                } else if (selected.length() >= 2 && selected.charAt(1) == ':') {
-                    // Fallback: usar letra de unidad
-                    String driveLetter = selected.substring(0, 1);
-                    deviceField.setText("\\\\.\\"+  driveLetter + ":");
-                }
-            }
-        });
-        
-        fileTable.addMouseListener(new MouseAdapter() {
-            @Override
-            public void mouseClicked(MouseEvent e) {
-                if (e.getClickCount() == 2) {
-                    readSelectedFile();
-                }
-            }
-        });
-        
-        fileTable.getSelectionModel().addListSelectionListener(e -> {
-            if (!e.getValueIsAdjusting()) {
+            if (selectingFromCode) return;
+            Object item = diskComboBox.getSelectedItem();
+            if (item instanceof DiskItem) {
+                DiskItem d = (DiskItem) item;
+                deviceField.setText(d.path);
+                baseOffsetField.setText("0");
                 updateButtonStates();
             }
         });
-        
-        // Detectar discos al iniciar
-        SwingUtilities.invokeLater(() -> detectPhysicalDisks());
-    }
-    
-    /**
-     * Detectar discos removibles usando PowerShell (Windows)
-     * Obtiene el PhysicalDriveN correspondiente a cada letra de unidad
-     */
-    private void detectPhysicalDisks() {
-        diskComboBox.removeAllItems();
-        diskComboBox.addItem("Detectando discos...");
-        
-        new Thread(() -> {
-            try {
-                List<String[]> disks = new ArrayList<>();
-                
-                // Usar PowerShell para obtener volúmenes removibles con su PhysicalDrive
-                ProcessBuilder pb = new ProcessBuilder(
-                    "powershell", "-Command",
-                    "Get-Partition | Where-Object {$_.DriveLetter -ne $null} | ForEach-Object { " +
-                    "$part = $_; " +
-                    "$vol = Get-Volume -Partition $part -ErrorAction SilentlyContinue; " +
-                    "if ($vol -and ($vol.DriveType -eq 'Removable')) { " +
-                    "  $part.DriveLetter + '|' + $part.DiskNumber + '|' + $vol.FileSystemLabel + '|' + [math]::Round($vol.Size/1GB,2) + '|' + $vol.DriveType " +
-                    "} " +
-                    "}"
-                );
-                pb.redirectErrorStream(true);
-                Process process = pb.start();
-                
-                BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-                String line;
-                while ((line = reader.readLine()) != null) {
-                    line = line.trim();
-                    if (!line.isEmpty() && line.contains("|")) {
-                        String[] parts = line.split("\\|");
-                        if (parts.length >= 4) {
-                            String driveLetter = parts[0].trim();
-                            String diskNumber = parts[1].trim();
-                            String label = parts[2].trim();
-                            String sizeGB = parts[3].trim();
-                            String driveType = parts.length > 4 ? parts[4].trim() : "Removable";
-                            
-                            if (label.isEmpty()) label = "Sin etiqueta";
-                            
-                            // Guardar: [displayText, physicalDrive]
-                            String displayText = String.format("%s: - %s (%.2f GB) [%s]", 
-                                driveLetter, label, Double.parseDouble(sizeGB.isEmpty() ? "0" : sizeGB), driveType);
-                            disks.add(new String[]{displayText, diskNumber, driveLetter});
-                        }
-                    }
-                }
-                process.waitFor();
-                
-                // Actualizar combo en el hilo de UI
-                final List<String[]> finalDisks = disks;
-                SwingUtilities.invokeLater(() -> {
-                    diskComboBox.removeAllItems();
-                    if (finalDisks.isEmpty()) {
-                        diskComboBox.addItem("No se detectaron unidades removibles");
-                        log("No se detectaron unidades removibles");
-                    } else {
-                        for (String[] disk : finalDisks) {
-                            // Formato: "F: - Label (X GB) [Type]|DiskNum|DriveLetter"
-                            diskComboBox.addItem(disk[0] + "|" + disk[1] + "|" + disk[2]);
-                        }
-                        log("Detectadas " + finalDisks.size() + " unidad(es) removible(s)");
-                    }
-                });
-                
-            } catch (Exception e) {
-                SwingUtilities.invokeLater(() -> {
-                    diskComboBox.removeAllItems();
-                    diskComboBox.addItem("Error al detectar discos");
-                    log("Error detectando discos: " + e.getMessage());
-                });
+
+        fileTable.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() == 2) viewSelected();
             }
-        }).start();
+        });
+        fileTable.getSelectionModel().addListSelectionListener(e -> {
+            if (!e.getValueIsAdjusting()) updateButtonStates();
+        });
+
+        // F2 renombra el archivo seleccionado
+        fileTable.getInputMap(JComponent.WHEN_FOCUSED).put(KeyStroke.getKeyStroke(java.awt.event.KeyEvent.VK_F2, 0), "microfs-rename");
+        fileTable.getActionMap().put("microfs-rename", new AbstractAction() {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public void actionPerformed(java.awt.event.ActionEvent e) {
+                renameSelected();
+            }
+        });
+
+        SwingUtilities.invokeLater(this::detectDisks);
     }
-    
-    private void updateButtonStates() {
-        boolean hasSelection = fileTable.getSelectedRow() >= 0;
-        boolean hasDevice = !deviceField.getText().trim().isEmpty();
-        
-        formatButton.setEnabled(hasDevice);  // Formatear siempre disponible si hay dispositivo
-        refreshButton.setEnabled(connected);
-        readButton.setEnabled(connected && hasSelection);
-        writeButton.setEnabled(connected);
-        deleteButton.setEnabled(connected && hasSelection);
-        importButton.setEnabled(connected);
-        exportButton.setEnabled(connected && hasSelection);
-    }
-    
+
     private void log(String message) {
         SwingUtilities.invokeLater(() -> {
             logArea.append(message + "\n");
             logArea.setCaretPosition(logArea.getDocument().getLength());
         });
     }
-    
-    private void setStatus(String status) {
-        SwingUtilities.invokeLater(() -> statusLabel.setText(status));
+
+    private void updateButtonStates() {
+        boolean hasDevice = !deviceField.getText().trim().isEmpty();
+        boolean opened = fs.isMounted() && fs.getDevice() != null;
+        boolean hasRow = fileTable.getSelectedRow() >= 0;
+
+        // El medio propuesto (imagen o disco) siempre se puede abrir o formatear.
+        connectButton.setEnabled(hasDevice);
+        disconnectButton.setEnabled(opened);
+        formatButton.setEnabled(hasDevice);
+        saveButton.setEnabled(dirty || contentArea.isEditable());
+        undoButton.setEnabled(dirty && journal.isCaptured());
+        viewButton.setEnabled(hasRow);
+        editButton.setEnabled(hasRow);
+        deleteButton.setEnabled(hasRow);
+        renameButton.setEnabled(hasRow);
+        importButton.setEnabled(true);
+        exportButton.setEnabled(hasRow);
+        updateStatus();
     }
-    
-    // ==================== Operaciones MicroFS ====================
-    
-    private byte[] readSector(int sector) throws IOException {
-        byte[] buffer = new byte[SECTOR_SIZE];
-        
-        // En Windows, usar FileInputStream para dispositivos físicos
-        try (FileInputStream fis = new FileInputStream(currentDevice)) {
-            java.nio.channels.FileChannel channel = fis.getChannel();
-            java.nio.ByteBuffer byteBuffer = java.nio.ByteBuffer.wrap(buffer);
-            channel.position((long) sector * SECTOR_SIZE);
-            int bytesRead = channel.read(byteBuffer);
-            if (bytesRead < SECTOR_SIZE) {
-                // Rellenar con ceros si es necesario
-                for (int i = Math.max(0, bytesRead); i < SECTOR_SIZE; i++) {
-                    buffer[i] = 0;
-                }
-            }
+
+    private void updateStatus() {
+        StringBuilder sb = new StringBuilder();
+        if (fs.getDevice() == null) {
+            sb.append("Sin medio abierto");
+        } else if (!fs.isMounted()) {
+            sb.append("Medio cerrado");
+        } else {
+            sb.append(fs.getDevice());
+            sb.append(" | Archivos: ").append(fs.getFileCount()).append('/').append(MicroFSManager.MAX_ENTRIES_IN_SECTOR);
+            sb.append(" | Próximo sector libre: ").append(fs.getNextSector());
+            long free = fs.freeSectors();
+            sb.append(" | Espacio libre: ").append(free < 0 ? "desconocido"
+                    : MicroFSManager.humanSize(free * MicroFSManager.SECTOR_SIZE));
+            sb.append(" | Sector 0 en offset ").append(fs.getBaseOffset());
         }
-        return buffer;
+        sb.append(dirty ? " | CAMBIOS SIN GUARDAR" : " | Sin cambios pendientes");
+        statusLabel.setText(sb.toString());
+        setTitle("MicroFS Browser v2.0" + (dirty ? " *" : ""));
     }
-    
-    private void writeSector(int sector, byte[] data) throws IOException {
-        byte[] buffer = new byte[SECTOR_SIZE];
-        System.arraycopy(data, 0, buffer, 0, Math.min(data.length, SECTOR_SIZE));
-        
-        // Crear archivo temporal con los datos del sector
-        File tempFile = File.createTempFile("microfs_sector_", ".bin");
-        try {
-            Files.write(tempFile.toPath(), buffer);
-            
-            // Usar PowerShell para escribir directamente al disco físico
-            // Esto evita las restricciones de Java con dispositivos raw
-            long offset = (long) sector * SECTOR_SIZE;
-            
-            ProcessBuilder pb = new ProcessBuilder(
-                "powershell", "-Command",
-                "$bytes = [System.IO.File]::ReadAllBytes('" + tempFile.getAbsolutePath().replace("'", "''") + "'); " +
-                "$fs = [System.IO.File]::Open('" + currentDevice.replace("'", "''") + "', " +
-                "[System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite); " +
-                "$fs.Seek(" + offset + ", [System.IO.SeekOrigin]::Begin) | Out-Null; " +
-                "$fs.Write($bytes, 0, $bytes.Length); " +
-                "$fs.Flush(); " +
-                "$fs.Close();"
-            );
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
-            
-            BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-            StringBuilder output = new StringBuilder();
-            String line;
-            while ((line = reader.readLine()) != null) {
-                output.append(line).append("\n");
-            }
-            
-            int exitCode = process.waitFor();
-            if (exitCode != 0) {
-                throw new IOException("Error al escribir sector " + sector + ": " + output.toString().trim());
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("Escritura interrumpida", e);
-        } finally {
-            tempFile.delete();
-        }
-    }
-    
-    private void loadSuperblock() throws IOException {
-        byte[] data = readSector(0);
-        
-        // Leer header
-        int magic = (data[0] & 0xFF) | ((data[1] & 0xFF) << 8);
-        int version = (data[2] & 0xFF) | ((data[3] & 0xFF) << 8);
-        numFiles = (data[4] & 0xFF) | ((data[5] & 0xFF) << 8);
-        nextSector = (data[6] & 0xFF) | ((data[7] & 0xFF) << 8);
-        
-        if (magic != MFS_MAGIC) {
-            throw new IOException("No es un sistema MicroFS válido (magic: 0x" + 
-                                  Integer.toHexString(magic) + ")");
-        }
-        
-        // Leer entradas de archivos (15 entradas de 32 bytes cada una)
-        files.clear();
-        for (int i = 0; i < MFS_MAX_FILES; i++) {
-            int offset = 16 + i * 32;
-            if (offset + 19 > SECTOR_SIZE) break;
-            
-            // Nombre (12 bytes)
-            StringBuilder nameBuilder = new StringBuilder();
-            for (int j = 0; j < MFS_NAME_LEN; j++) {
-                byte b = data[offset + j];
-                if (b == 0) break;
-                nameBuilder.append((char) b);
-            }
-            String name = nameBuilder.toString();
-            
-            // Campos numéricos
-            int startSector = (data[offset + 12] & 0xFF) | ((data[offset + 13] & 0xFF) << 8);
-            int size = (data[offset + 14] & 0xFF) | ((data[offset + 15] & 0xFF) << 8);
-            int sectors = (data[offset + 16] & 0xFF) | ((data[offset + 17] & 0xFF) << 8);
-            int flags = data[offset + 18] & 0xFF;
-            
-            files.add(new MFSFileEntry(name, startSector, size, sectors, flags));
-        }
-    }
-    
-    private void saveSuperblock() throws IOException {
-        byte[] data = new byte[SECTOR_SIZE];
-        
-        // Header
-        data[0] = (byte) (MFS_MAGIC & 0xFF);
-        data[1] = (byte) ((MFS_MAGIC >> 8) & 0xFF);
-        data[2] = 1; // version
-        data[3] = 0;
-        data[4] = (byte) (numFiles & 0xFF);
-        data[5] = (byte) ((numFiles >> 8) & 0xFF);
-        data[6] = (byte) (nextSector & 0xFF);
-        data[7] = (byte) ((nextSector >> 8) & 0xFF);
-        
-        // Entradas (15 entradas * 32 bytes = 480 bytes, offset 16, total = 496)
-        for (int i = 0; i < MFS_MAX_FILES; i++) {
-            MFSFileEntry entry = (i < files.size()) ? files.get(i) : new MFSFileEntry();
-            int offset = 16 + i * 32;
-            
-            // Verificar que no excedemos el sector
-            if (offset + 19 > SECTOR_SIZE) break;
-            
-            // Nombre
-            byte[] nameBytes = entry.name.getBytes("ASCII");
-            for (int j = 0; j < MFS_NAME_LEN; j++) {
-                data[offset + j] = (j < nameBytes.length) ? nameBytes[j] : 0;
-            }
-            
-            // Campos numéricos
-            data[offset + 12] = (byte) (entry.startSector & 0xFF);
-            data[offset + 13] = (byte) ((entry.startSector >> 8) & 0xFF);
-            data[offset + 14] = (byte) (entry.size & 0xFF);
-            data[offset + 15] = (byte) ((entry.size >> 8) & 0xFF);
-            data[offset + 16] = (byte) (entry.sectors & 0xFF);
-            data[offset + 17] = (byte) ((entry.sectors >> 8) & 0xFF);
-            data[offset + 18] = (byte) (entry.flags & 0xFF);
-        }
-        
-        writeSector(0, data);
-    }
-    
-    private int findFile(String name) {
-        String upperName = name.toUpperCase();
-        for (int i = 0; i < files.size(); i++) {
-            if (files.get(i).name.toUpperCase().equals(upperName)) {
-                return i;
-            }
-        }
-        return -1;
-    }
-    
-    // ==================== Acciones de UI ====================
-    
-    private void connectToDevice() {
-        currentDevice = deviceField.getText().trim();
-        if (currentDevice.isEmpty()) {
-            JOptionPane.showMessageDialog(this, 
-                "Por favor, especifica un dispositivo", 
-                "Error", JOptionPane.ERROR_MESSAGE);
-            return;
-        }
-        
-        try {
-            loadSuperblock();
-            connected = true;
-            log("Conectado a " + currentDevice);
-            setStatus("Conectado: " + currentDevice + " | Archivos: " + numFiles + 
-                     " | Próximo sector: " + nextSector);
-            refreshFileTable();
-            updateButtonStates();
-            connectButton.setText("Reconectar");
-        } catch (IOException e) {
-            connected = false;
-            log("Error al conectar: " + e.getMessage());
-            JOptionPane.showMessageDialog(this, 
-                "Error al conectar:\n" + e.getMessage() + 
-                "\n\nAsegúrate de ejecutar como Administrador.", 
-                "Error de Conexión", JOptionPane.ERROR_MESSAGE);
-            updateButtonStates();
-        }
-    }
-    
-    private void formatDevice() {
-        currentDevice = deviceField.getText().trim();
-        if (currentDevice.isEmpty()) {
-            JOptionPane.showMessageDialog(this, 
-                "Por favor, especifica un dispositivo", 
-                "Error", JOptionPane.ERROR_MESSAGE);
-            return;
-        }
-        
-        int result = JOptionPane.showConfirmDialog(this,
-            "¿Estás seguro de que deseas formatear?\n" +
-            "Dispositivo: " + currentDevice + "\n\n" +
-            "¡TODOS LOS DATOS SERÁN ELIMINADOS!",
-            "Confirmar Formateo",
-            JOptionPane.YES_NO_OPTION,
-            JOptionPane.WARNING_MESSAGE);
-        
-        if (result != JOptionPane.YES_OPTION) {
-            return;
-        }
-        
-        try {
-            numFiles = 0;
-            nextSector = 1;
-            files.clear();
-            for (int i = 0; i < MFS_MAX_FILES; i++) {
-                files.add(new MFSFileEntry());
-            }
-            saveSuperblock();
-            
-            connected = true;
-            log("SD formateada con MicroFS");
-            setStatus("Formateado: " + currentDevice);
-            refreshFileTable();
-            updateButtonStates();
-            connectButton.setText("Reconectar");
-            
-            JOptionPane.showMessageDialog(this, 
-                "SD formateada correctamente con MicroFS", 
-                "Formateo Completo", JOptionPane.INFORMATION_MESSAGE);
-                
-        } catch (IOException e) {
-            log("Error al formatear: " + e.getMessage());
-            JOptionPane.showMessageDialog(this, 
-                "Error al formatear:\n" + e.getMessage(), 
-                "Error", JOptionPane.ERROR_MESSAGE);
-        }
-    }
-    
-    private void refreshFileList() {
-        if (!connected) return;
-        
-        try {
-            loadSuperblock();
-            refreshFileTable();
-            setStatus("Conectado: " + currentDevice + " | Archivos: " + numFiles + 
-                     " | Próximo sector: " + nextSector);
-            log("Lista de archivos actualizada");
-        } catch (IOException e) {
-            log("Error al actualizar: " + e.getMessage());
-        }
-    }
-    
-    private void refreshFileTable() {
-        tableModel.setRowCount(0);
-        int index = 0;
-        for (MFSFileEntry entry : files) {
-            if (!entry.name.isEmpty()) {
-                tableModel.addRow(new Object[]{
-                    index,
-                    entry.name,
-                    entry.size + " bytes",
-                    entry.sectors,
-                    entry.startSector
-                });
-            }
-            index++;
-        }
-    }
-    
-    private void readSelectedFile() {
-        int selectedRow = fileTable.getSelectedRow();
-        if (selectedRow < 0) {
-            JOptionPane.showMessageDialog(this, 
-                "Selecciona un archivo de la lista", 
-                "Aviso", JOptionPane.WARNING_MESSAGE);
-            return;
-        }
-        
-        String fileName = (String) tableModel.getValueAt(selectedRow, 1);
-        
-        try {
-            int idx = findFile(fileName);
-            if (idx < 0) {
-                log("Archivo no encontrado: " + fileName);
-                return;
-            }
-            
-            MFSFileEntry entry = files.get(idx);
-            byte[] data = new byte[entry.size];
-            int bytesRead = 0;
-            
-            for (int s = 0; s < entry.sectors && bytesRead < entry.size; s++) {
-                byte[] sectorData = readSector(entry.startSector + s);
-                int toCopy = Math.min(SECTOR_SIZE, entry.size - bytesRead);
-                System.arraycopy(sectorData, 0, data, bytesRead, toCopy);
-                bytesRead += toCopy;
-            }
-            
-            // Mostrar contenido
-            String content = new String(data, "UTF-8");
-            contentArea.setText(content);
-            contentArea.setCaretPosition(0);
-            
-            log("Leído: " + fileName + " (" + entry.size + " bytes)");
-            
-        } catch (IOException e) {
-            log("Error al leer: " + e.getMessage());
-            JOptionPane.showMessageDialog(this, 
-                "Error al leer archivo:\n" + e.getMessage(), 
-                "Error", JOptionPane.ERROR_MESSAGE);
-        }
-    }
-    
-    private void writeFile() {
-        String fileName = JOptionPane.showInputDialog(this, 
-            "Nombre del archivo (max 11 caracteres, ej: TEST.TXT):",
-            "Escribir Archivo",
-            JOptionPane.QUESTION_MESSAGE);
-        
-        if (fileName == null || fileName.trim().isEmpty()) {
-            return;
-        }
-        
-        fileName = fileName.toUpperCase().trim();
-        if (fileName.length() > MFS_NAME_LEN - 1) {
-            fileName = fileName.substring(0, MFS_NAME_LEN - 1);
-        }
-        
-        String content = contentArea.getText();
-        if (content.isEmpty()) {
-            int result = JOptionPane.showConfirmDialog(this,
-                "El contenido está vacío. ¿Deseas crear un archivo vacío?",
-                "Confirmar",
-                JOptionPane.YES_NO_OPTION);
-            if (result != JOptionPane.YES_OPTION) {
-                return;
-            }
-        }
-        
-        try {
-            byte[] contentBytes = content.getBytes("UTF-8");
-            int idx = findFile(fileName);
-            
-            if (idx >= 0) {
-                // Archivo existe
-                MFSFileEntry entry = files.get(idx);
-                if (contentBytes.length > entry.sectors * SECTOR_SIZE) {
-                    JOptionPane.showMessageDialog(this,
-                        "El contenido es muy grande para el archivo existente.\n" +
-                        "Máximo: " + (entry.sectors * SECTOR_SIZE) + " bytes\n" +
-                        "Actual: " + contentBytes.length + " bytes",
-                        "Error", JOptionPane.ERROR_MESSAGE);
-                    return;
-                }
-                
-                // Escribir datos
-                for (int s = 0; s < entry.sectors; s++) {
-                    byte[] sectorData = new byte[SECTOR_SIZE];
-                    int start = s * SECTOR_SIZE;
-                    int toCopy = Math.min(SECTOR_SIZE, contentBytes.length - start);
-                    if (toCopy > 0) {
-                        System.arraycopy(contentBytes, start, sectorData, 0, toCopy);
+
+    // ==================== Detección ====================
+
+    private void detectDisks() {
+        selectingFromCode = true;
+        diskComboBox.removeAllItems();
+        diskComboBox.addItem(new DiskItem("Detectando…", ""));
+
+        new Thread(() -> {
+            List<DiskItem> items = new ArrayList<>();
+            try {
+                if (DeviceAccess.isWindows()) {
+                    String script =
+                            "$ErrorActionPreference='SilentlyContinue'; " +
+                            "Get-Disk | ForEach-Object { " +
+                            "  $disk = $_; $diskNumber = [int]$disk.Number; " +
+                            "  $letters = @(); " +
+                            "  foreach ($part in (Get-Partition -DiskNumber $diskNumber)) { " +
+                            "    if ($part.DriveLetter) { $letters += ($part.DriveLetter + ':') } } " +
+                            "  $sizeGb = [string][math]::Round([double]$disk.Size / 1GB, 2); " +
+                            "  $bus = [string]$disk.BusType; " +
+                            "  $lettersText = [string]($letters -join ','); " +
+                            "  $line = @([string]$diskNumber, [string]$disk.FriendlyName, $bus, $sizeGb, $lettersText); " +
+                            "  Write-Output ($line -join '|'); " +
+                            "}";
+                    String out = DeviceAccess.Powershell.run(script);
+                    log("Discos informados por Windows:\n" + out.trim());
+                    for (String line : out.split("\\R")) {
+                        String t = line.trim();
+                        if (t.isEmpty() || !t.contains("|")) continue;
+                        String[] p = t.split("\\|", -1);
+                        if (p.length < 4) continue;
+
+                        String number = p[0].trim();
+                        String model = p.length > 1 ? p[1].trim() : "";
+                        String bus = p.length > 2 ? p[2].trim() : "";
+                        String size = p.length > 3 ? p[3].trim() : "?";
+                        String letters = p.length > 4 ? p[4].trim() : "";
+                        if (number.isEmpty()) continue;
+
+                        boolean removable = bus.equalsIgnoreCase("SD") || bus.equalsIgnoreCase("USB")
+                                || bus.equalsIgnoreCase("MMC") || bus.equalsIgnoreCase("1394")
+                                || model.toUpperCase().contains("CARD")
+                                || model.toUpperCase().contains("STORAGE")
+                                || model.toUpperCase().contains("SD/MMC");
+                        // Prioridad: SD/MMC > almacenamiento USB con datos > resto.
+                        double sizeGb = 0;
+                        try {
+                            sizeGb = Double.parseDouble(size);
+                        } catch (NumberFormatException ignored) {
+                            // tamaño no numérico
+                        }
+                        int score = 0;
+                        if (bus.equalsIgnoreCase("SD") || bus.equalsIgnoreCase("MMC")) score = 100;
+                        else if (removable && sizeGb > 0) score = 50;
+
+                        String mount = letters.isEmpty()
+                                ? "sin letra de unidad"
+                                : "unidades " + letters + " (quitarlas para escribir)";
+
+                        String label = "Disco " + number + " — " + model + " [" + bus + ", " + size + " GB, "
+                                + mount + "]"
+                                + (removable ? "" : "  (no parece SD/USB)");
+                        items.add(new DiskItem(label, "\\\\.\\PhysicalDrive" + number, score));
                     }
-                    writeSector(entry.startSector + s, sectorData);
-                }
-                
-                entry.size = contentBytes.length;
-                saveSuperblock();
-                log("Archivo actualizado: " + fileName + " (" + contentBytes.length + " bytes)");
-                
-            } else {
-                // Crear nuevo archivo
-                int slot = -1;
-                for (int i = 0; i < files.size(); i++) {
-                    if (files.get(i).name.isEmpty()) {
-                        slot = i;
-                        break;
+                } else {
+                    File devDir = new File("/dev");
+                    File[] devs = devDir.listFiles((dir, n) -> n.matches("(sd[a-z]|mmcblk\\d+|nvme\\d+n\\d+)$"));
+                    if (devs != null) {
+                        java.util.Arrays.sort(devs);
+                        for (File dev : devs) {
+                            items.add(new DiskItem(dev.getAbsolutePath(), dev.getAbsolutePath()));
+                        }
                     }
                 }
-                
-                if (slot < 0) {
-                    JOptionPane.showMessageDialog(this,
-                        "No hay espacio para más archivos (máximo: " + MFS_MAX_FILES + ")",
-                        "Error", JOptionPane.ERROR_MESSAGE);
-                    return;
-                }
-                
-                int sectors = (contentBytes.length + SECTOR_SIZE - 1) / SECTOR_SIZE;
-                if (sectors == 0) sectors = 1;
-                
-                // Escribir datos
-                for (int s = 0; s < sectors; s++) {
-                    byte[] sectorData = new byte[SECTOR_SIZE];
-                    int start = s * SECTOR_SIZE;
-                    int toCopy = Math.min(SECTOR_SIZE, contentBytes.length - start);
-                    if (toCopy > 0) {
-                        System.arraycopy(contentBytes, start, sectorData, 0, toCopy);
-                    }
-                    writeSector(nextSector + s, sectorData);
-                }
-                
-                // Crear entrada
-                files.set(slot, new MFSFileEntry(fileName, nextSector, 
-                                                  contentBytes.length, sectors, 0));
-                nextSector += sectors;
-                numFiles++;
-                saveSuperblock();
-                
-                log("Archivo creado: " + fileName + " (" + contentBytes.length + 
-                    " bytes, " + sectors + " sector(es))");
+            } catch (Exception ex) {
+                log("No se pudieron detectar los discos: " + ex.getMessage());
             }
-            
-            refreshFileTable();
-            setStatus("Conectado: " + currentDevice + " | Archivos: " + numFiles + 
-                     " | Próximo sector: " + nextSector);
-            
-            JOptionPane.showMessageDialog(this, 
-                "Archivo guardado: " + fileName, 
-                "Éxito", JOptionPane.INFORMATION_MESSAGE);
-                
-        } catch (IOException e) {
-            log("Error al escribir: " + e.getMessage());
-            JOptionPane.showMessageDialog(this, 
-                "Error al escribir archivo:\n" + e.getMessage(), 
-                "Error", JOptionPane.ERROR_MESSAGE);
+
+            final List<DiskItem> found = items;
+            SwingUtilities.invokeLater(() -> {
+                selectingFromCode = true;
+                diskComboBox.removeAllItems();
+                if (found.isEmpty()) {
+                    diskComboBox.addItem(new DiskItem("No se detectaron discos; usa una imagen .img", ""));
+                } else {
+                    for (DiskItem item : found) diskComboBox.addItem(item);
+                    // Elegir el medio con más posibilidades de ser la tarjeta:
+                    // 1) SD/MMC, 2) USB con datos, 3) cualquier otro.
+                    int best = -1;
+                    int bestScore = -1;
+                    for (int i = 0; i < found.size(); i++) {
+                        int score = found.get(i).score;
+                        if (score > bestScore) {
+                            bestScore = score;
+                            best = i;
+                        }
+                    }
+                    if (best >= 0 && bestScore > 0) {
+                        diskComboBox.setSelectedIndex(best);
+                        DiskItem chosen = found.get(best);
+                        deviceField.setText(chosen.path);
+                        baseOffsetField.setText("0");
+                    } else {
+                        diskComboBox.setSelectedIndex(-1);
+                        deviceField.setText("");
+                    }
+                }
+                selectingFromCode = false;
+                updateButtonStates();
+            });
+        }, "microfs-detect-disks").start();
+    }
+
+    // ==================== Abrir medio ====================
+
+    private File chooseImageFile(boolean save) {
+        JFileChooser chooser = new JFileChooser();
+        chooser.setFileFilter(new FileNameExtensionFilter("Imágenes de tarjeta SD (*.img, *.bin, *.dsk, *.raw)", IMAGE_FILTER));
+        if (save) {
+            int r = chooser.showSaveDialog(this);
+            if (r != JFileChooser.APPROVE_OPTION) return null;
+            rememberFolder(chooser);
+            return ensureExtension(chooser.getSelectedFile());
+        }
+        int r = chooser.showOpenDialog(this);
+        if (r != JFileChooser.APPROVE_OPTION) return null;
+        rememberFolder(chooser);
+        return chooser.getSelectedFile();
+    }
+
+    /** Abre un selector recordando la última carpeta usada. */
+    private JFileChooser newFileChooser() {
+        JFileChooser chooser = new JFileChooser();
+        String last = Preferences.userNodeForPackage(MicroFSBrowser.class).get(LAST_FOLDER_PREF, "");
+        if (!last.isEmpty()) {
+            File folder = new File(last);
+            if (folder.isDirectory()) {
+                chooser.setCurrentDirectory(folder);
+            }
+        }
+        return chooser;
+    }
+
+    /** Guarda la carpeta del selector para la próxima vez. */
+    private void rememberFolder(JFileChooser chooser) {
+        File folder = chooser.getCurrentDirectory();
+        if (chooser.getSelectedFile() != null && chooser.getSelectedFile().getParentFile() != null) {
+            File parent = chooser.getSelectedFile().getParentFile();
+            if (parent.isDirectory()) folder = parent;
+        }
+        if (folder != null) {
+            Preferences.userNodeForPackage(MicroFSBrowser.class).put(LAST_FOLDER_PREF, folder.getAbsolutePath());
         }
     }
-    
-    private void deleteSelectedFile() {
-        int selectedRow = fileTable.getSelectedRow();
-        if (selectedRow < 0) {
-            JOptionPane.showMessageDialog(this, 
-                "Selecciona un archivo de la lista", 
-                "Aviso", JOptionPane.WARNING_MESSAGE);
-            return;
+
+    private File ensureExtension(File file) {
+        String name = file.getName().toLowerCase();
+        for (String ext : IMAGE_FILTER) {
+            if (name.endsWith("." + ext)) return file;
         }
-        
-        String fileName = (String) tableModel.getValueAt(selectedRow, 1);
-        
-        int result = JOptionPane.showConfirmDialog(this,
-            "¿Eliminar archivo '" + fileName + "'?",
-            "Confirmar Eliminación",
-            JOptionPane.YES_NO_OPTION,
-            JOptionPane.WARNING_MESSAGE);
-        
-        if (result != JOptionPane.YES_OPTION) {
-            return;
+        return new File(file.getAbsolutePath() + ".img");
+    }
+
+    private void chooseExistingImage() {
+        if (!preparePendingEdits()) return;
+        File file = chooseImageFile(false);
+        if (file == null) return;
+        deviceField.setText(file.getAbsolutePath());
+        openMedium();
+    }
+
+    private void createNewImage() {
+        if (!preparePendingEdits()) return;
+        File file = chooseImageFile(true);
+        if (file == null) return;
+
+        Integer mb = askSizeMb();
+        if (mb == null) return;
+        long requested = (long) mb * 1024 * 1024;
+        long size = DeviceAccess.limitForMicroFS(requested);
+        if (size < requested) {
+            JOptionPane.showMessageDialog(this,
+                    "MicroFS direcciona como máximo " + MicroFSManager.MAX_MEDIA_BYTES / (1024 * 1024) +
+                    " MB de datos (sectores en 16 bits).\nSe creará una imagen de " +
+                    MicroFSManager.MAX_MEDIA_BYTES / (1024 * 1024) + " MB.",
+                    "Límite de MicroFS", JOptionPane.INFORMATION_MESSAGE);
         }
-        
         try {
-            int idx = findFile(fileName);
-            if (idx < 0) {
-                log("Archivo no encontrado: " + fileName);
-                return;
-            }
-            
-            files.set(idx, new MFSFileEntry());
-            numFiles--;
-            saveSuperblock();
-            
-            refreshFileTable();
+            DeviceAccess.createImage(file.getAbsolutePath(), size);
+            MicroFSManager fresh = new MicroFSManager();
+            fresh.setTarget(file.getAbsolutePath(), 0);
+            fresh.flush();
+            log("Imagen creada: " + file.getAbsolutePath() + " (" + MicroFSManager.humanSize(size) + ")");
+            deviceField.setText(file.getAbsolutePath());
+            baseOffsetField.setText("0");
+            openMedium();
+        } catch (IOException ex) {
+            showError("No se pudo crear la imagen", ex, file.getAbsolutePath());
+        }
+    }
+
+    private Integer askSizeMb() {
+        String[] options = {"1 MB", "4 MB", "16 MB", "32 MB", "Otra…"};
+        int[] sizes = {1, 4, 16, 32};
+        Object choice = JOptionPane.showInputDialog(this,
+                "Tamaño de la imagen (1 MB es suficiente para el máximo de MicroFS):",
+                "Crear imagen", JOptionPane.QUESTION_MESSAGE, null, options, options[0]);
+        if (choice == null) return null;
+        String value = choice.toString();
+        for (int i = 0; i < sizes.length; i++) {
+            if (options[i].equals(value)) return sizes[i];
+        }
+        String custom = JOptionPane.showInputDialog(this, "Tamaño en MB:", "8");
+        if (custom == null) return null;
+        try {
+            return Math.max(1, Integer.parseInt(custom.trim()));
+        } catch (NumberFormatException ex) {
+            JOptionPane.showMessageDialog(this, "Tamaño inválido.", "Error", JOptionPane.ERROR_MESSAGE);
+            return null;
+        }
+    }
+
+    private long parseBaseOffset() {
+        String t = baseOffsetField.getText() == null ? "" : baseOffsetField.getText().trim();
+        if (t.isEmpty()) return 0;
+        try {
+            long v = t.toLowerCase().startsWith("0x") ? Long.parseLong(t.substring(2), 16) : Long.parseLong(t);
+            return v >= 0 && v % MicroFSManager.SECTOR_SIZE == 0 ? v : -1;
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    private void openMedium() {
+        if (!preparePendingEdits()) return;
+        String device = deviceField.getText().trim();
+        if (device.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "Indica una imagen o un dispositivo.",
+                    "Aviso", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        long offset = parseBaseOffset();
+        if (offset < 0) {
+            JOptionPane.showMessageDialog(this,
+                    "El offset debe ser 0 o un múltiplo de 512 bytes.", "Aviso", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        if (dirty && !confirmDiscard()) return;
+
+        try {
+            String resolved = DevicePaths.resolve(device, null);
+            fs.mount(resolved, offset);
+            dirty = false;
+            journal.clear();
             contentArea.setText("");
-            setStatus("Conectado: " + currentDevice + " | Archivos: " + numFiles + 
-                     " | Próximo sector: " + nextSector);
-            log("Archivo eliminado: " + fileName);
-            
-            JOptionPane.showMessageDialog(this, 
-                "Archivo eliminado: " + fileName, 
-                "Éxito", JOptionPane.INFORMATION_MESSAGE);
-                
-        } catch (IOException e) {
-            log("Error al eliminar: " + e.getMessage());
-            JOptionPane.showMessageDialog(this, 
-                "Error al eliminar archivo:\n" + e.getMessage(), 
-                "Error", JOptionPane.ERROR_MESSAGE);
+            log("MicroFS abierto: " + resolved + " (sector 0 en offset " + offset + ", " +
+                    fs.getFileCount() + " archivo(s))");
+            if (!resolved.equals(device)) {
+                log("Nota: la ruta " + device + " no admite acceso directo; se usó " + resolved +
+                        " (misma tarjeta). Para escribir conviene quitar la letra de unidad.");
+            }
+            refreshTable();
+        } catch (IOException ex) {
+            fs.close();
+            showError("No se pudo abrir MicroFS", ex, device);
+            refreshTable();
         }
     }
-    
-    private void importFile() {
-        JFileChooser fileChooser = new JFileChooser();
-        fileChooser.setDialogTitle("Seleccionar archivo a importar");
-        
-        int result = fileChooser.showOpenDialog(this);
-        if (result != JFileChooser.APPROVE_OPTION) {
+
+    private void detectBaseOffset() {
+        if (!preparePendingEdits()) return;
+        String device = deviceField.getText().trim();
+        if (device.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "Indica primero la imagen o el dispositivo.",
+                    "Aviso", JOptionPane.WARNING_MESSAGE);
             return;
         }
-        
-        File localFile = fileChooser.getSelectedFile();
-        
-        // Pedir nombre en MicroFS
-        String defaultName = localFile.getName().toUpperCase();
-        if (defaultName.length() > MFS_NAME_LEN - 1) {
-            defaultName = defaultName.substring(0, MFS_NAME_LEN - 1);
-        }
-        
-        String mfsName = (String) JOptionPane.showInputDialog(this,
-            "Nombre del archivo en MicroFS:",
-            "Nombre en MicroFS",
-            JOptionPane.QUESTION_MESSAGE,
-            null, null, defaultName);
-        
-        if (mfsName == null || mfsName.trim().isEmpty()) {
-            return;
-        }
-        
-        mfsName = mfsName.toUpperCase().trim();
-        if (mfsName.length() > MFS_NAME_LEN - 1) {
-            mfsName = mfsName.substring(0, MFS_NAME_LEN - 1);
-        }
-        
         try {
-            byte[] contentBytes = Files.readAllBytes(localFile.toPath());
-            
-            // Verificar tamaño
-            if (contentBytes.length > 65535) {
+            Long found = findMicroFSBase(device);
+            if (found == null) {
                 JOptionPane.showMessageDialog(this,
-                    "El archivo es muy grande (máximo: 65535 bytes)",
-                    "Error", JOptionPane.ERROR_MESSAGE);
+                        "No se encontró la firma \"FM\" de MicroFS en el medio.\n" +
+                        "Puedes formatearlo desde este programa.", "Sin resultados", JOptionPane.WARNING_MESSAGE);
                 return;
             }
-            
-            // Usar lógica similar a writeFile
-            int idx = findFile(mfsName);
-            
-            if (idx >= 0) {
-                MFSFileEntry entry = files.get(idx);
-                if (contentBytes.length > entry.sectors * SECTOR_SIZE) {
-                    JOptionPane.showMessageDialog(this,
-                        "El contenido es muy grande para el archivo existente.",
-                        "Error", JOptionPane.ERROR_MESSAGE);
-                    return;
-                }
-                
-                for (int s = 0; s < entry.sectors; s++) {
-                    byte[] sectorData = new byte[SECTOR_SIZE];
-                    int start = s * SECTOR_SIZE;
-                    int toCopy = Math.min(SECTOR_SIZE, contentBytes.length - start);
-                    if (toCopy > 0) {
-                        System.arraycopy(contentBytes, start, sectorData, 0, toCopy);
-                    }
-                    writeSector(entry.startSector + s, sectorData);
-                }
-                
-                entry.size = contentBytes.length;
-                saveSuperblock();
-                
-            } else {
-                int slot = -1;
-                for (int i = 0; i < files.size(); i++) {
-                    if (files.get(i).name.isEmpty()) {
-                        slot = i;
-                        break;
-                    }
-                }
-                
-                if (slot < 0) {
-                    JOptionPane.showMessageDialog(this,
-                        "No hay espacio para más archivos",
-                        "Error", JOptionPane.ERROR_MESSAGE);
-                    return;
-                }
-                
-                int sectors = (contentBytes.length + SECTOR_SIZE - 1) / SECTOR_SIZE;
-                if (sectors == 0) sectors = 1;
-                
-                for (int s = 0; s < sectors; s++) {
-                    byte[] sectorData = new byte[SECTOR_SIZE];
-                    int start = s * SECTOR_SIZE;
-                    int toCopy = Math.min(SECTOR_SIZE, contentBytes.length - start);
-                    if (toCopy > 0) {
-                        System.arraycopy(contentBytes, start, sectorData, 0, toCopy);
-                    }
-                    writeSector(nextSector + s, sectorData);
-                }
-                
-                files.set(slot, new MFSFileEntry(mfsName, nextSector, 
-                                                  contentBytes.length, sectors, 0));
-                nextSector += sectors;
-                numFiles++;
-                saveSuperblock();
-            }
-            
-            refreshFileTable();
-            setStatus("Conectado: " + currentDevice + " | Archivos: " + numFiles + 
-                     " | Próximo sector: " + nextSector);
-            log("Importado: " + localFile.getName() + " -> " + mfsName + 
-                " (" + contentBytes.length + " bytes)");
-            
-            JOptionPane.showMessageDialog(this, 
-                "Archivo importado: " + mfsName, 
-                "Éxito", JOptionPane.INFORMATION_MESSAGE);
-                
-        } catch (IOException e) {
-            log("Error al importar: " + e.getMessage());
-            JOptionPane.showMessageDialog(this, 
-                "Error al importar archivo:\n" + e.getMessage(), 
-                "Error", JOptionPane.ERROR_MESSAGE);
+            baseOffsetField.setText(String.valueOf(found));
+            log("MicroFS detectado en el offset " + found + " (" + MicroFSManager.humanSize(found) + ")");
+        } catch (IOException ex) {
+            showError("No se pudo analizar el medio", ex, device);
         }
     }
-    
-    private void exportFile() {
-        int selectedRow = fileTable.getSelectedRow();
-        if (selectedRow < 0) {
-            JOptionPane.showMessageDialog(this, 
-                "Selecciona un archivo de la lista", 
-                "Aviso", JOptionPane.WARNING_MESSAGE);
-            return;
+
+    /** Busca la firma "FM" validando la coherencia de la tabla de archivos. */
+    private Long findMicroFSBase(String device) throws IOException {
+        List<Long> candidates = new ArrayList<>();
+        candidates.add(0L);
+
+        long total = DeviceAccess.size(device);
+        if (total > 0) {
+            byte[] mbr = new byte[MicroFSManager.SECTOR_SIZE];
+            try {
+                DeviceAccess.read(device, 0, mbr, MicroFSManager.SECTOR_SIZE);
+                for (int i = 0; i < 4; i++) {
+                    int base = 446 + i * 16;
+                    long lba = (mbr[base + 8] & 0xFFL) | ((mbr[base + 9] & 0xFFL) << 8)
+                            | ((mbr[base + 10] & 0xFFL) << 16) | ((mbr[base + 11] & 0xFFL) << 24);
+                    if (lba > 0 && lba * MicroFSManager.SECTOR_SIZE < total) {
+                        candidates.add(lba * MicroFSManager.SECTOR_SIZE);
+                    }
+                }
+            } catch (IOException ignored) {
+                // medio sin MBR legible
+            }
+            for (long mb : new long[]{1, 2, 4, 8}) {
+                candidates.add(mb * 1024 * 1024);
+            }
         }
-        
-        String fileName = (String) tableModel.getValueAt(selectedRow, 1);
-        
-        JFileChooser fileChooser = new JFileChooser();
-        fileChooser.setDialogTitle("Guardar archivo como");
-        fileChooser.setSelectedFile(new File(fileName));
-        
-        int result = fileChooser.showSaveDialog(this);
-        if (result != JFileChooser.APPROVE_OPTION) {
-            return;
+
+        for (long off : candidates) {
+            if (isMicroFSAt(device, off)) return off;
         }
-        
-        File localFile = fileChooser.getSelectedFile();
-        
+        return null;
+    }
+
+    private boolean isMicroFSAt(String device, long offset) {
         try {
-            int idx = findFile(fileName);
-            if (idx < 0) {
-                log("Archivo no encontrado: " + fileName);
-                return;
+            byte[] s = new byte[MicroFSManager.SECTOR_SIZE];
+            DeviceAccess.read(device, offset, s, MicroFSManager.SECTOR_SIZE);
+            if (!(s[0] == 0x46 && s[1] == 0x4D)) return false;
+            int next = (s[6] & 0xFF) | ((s[7] & 0xFF) << 8);
+            if (next < 1) return false;
+            for (int i = 0; i < MicroFSManager.MAX_ENTRIES_IN_SECTOR; i++) {
+                int off = 16 + i * 32;
+                if (s[off] == 0) continue;
+                int start = (s[off + 12] & 0xFF) | ((s[off + 13] & 0xFF) << 8);
+                int sectors = (s[off + 16] & 0xFF) | ((s[off + 17] & 0xFF) << 8);
+                if (start < 1 || start + sectors > next) return false;
+                for (int k = 0; k < MicroFSManager.MAX_NAME_LENGTH && s[off + k] != 0; k++) {
+                    int c = s[off + k] & 0xFF;
+                    if (c < 0x20 || c > 0x7E) return false;
+                }
             }
-            
-            MFSFileEntry entry = files.get(idx);
-            byte[] data = new byte[entry.size];
-            int bytesRead = 0;
-            
-            for (int s = 0; s < entry.sectors && bytesRead < entry.size; s++) {
-                byte[] sectorData = readSector(entry.startSector + s);
-                int toCopy = Math.min(SECTOR_SIZE, entry.size - bytesRead);
-                System.arraycopy(sectorData, 0, data, bytesRead, toCopy);
-                bytesRead += toCopy;
-            }
-            
-            Files.write(localFile.toPath(), data);
-            
-            log("Exportado: " + fileName + " -> " + localFile.getAbsolutePath());
-            
-            JOptionPane.showMessageDialog(this, 
-                "Archivo exportado a:\n" + localFile.getAbsolutePath(), 
-                "Éxito", JOptionPane.INFORMATION_MESSAGE);
-                
-        } catch (IOException e) {
-            log("Error al exportar: " + e.getMessage());
-            JOptionPane.showMessageDialog(this, 
-                "Error al exportar archivo:\n" + e.getMessage(), 
-                "Error", JOptionPane.ERROR_MESSAGE);
+            return true;
+        } catch (IOException ex) {
+            return false;
         }
     }
-    
+
+    // ==================== Tabla y contenido ====================
+
+    private void refreshTable() {
+        String keep = selectedName();
+        rowNames.clear();
+        List<MicroFSManager.Entry> list = fs.isMounted() ? fs.list() : new ArrayList<>();
+        tableModel.setRowCount(0);
+        for (MicroFSManager.Entry e : list) {
+            rowNames.add(e.getName());
+            tableModel.addRow(new Object[]{
+                    e.getName(),
+                    e.getSize(),
+                    e.getReservedBytes(),
+                    Math.max(0, e.getReservedBytes() - e.getSize()),
+                    e.getStartSector()
+            });
+        }
+        if (keep != null) {
+            for (int row = 0; row < fileTable.getRowCount(); row++) {
+                int model = fileTable.convertRowIndexToModel(row);
+                if (model < rowNames.size() && rowNames.get(model).equals(keep)) {
+                    fileTable.setRowSelectionInterval(row, row);
+                    break;
+                }
+            }
+        }
+        updateButtonStates();
+    }
+
+    private String selectedName() {
+        int row = fileTable.getSelectedRow();
+        if (row < 0) return null;
+        int model = fileTable.convertRowIndexToModel(row);
+        return model >= 0 && model < rowNames.size() ? rowNames.get(model) : null;
+    }
+
+    private void viewSelected() {
+        String name = selectedName();
+        if (name == null) return;
+        try {
+            byte[] data = fs.readFile(name);
+            ContentView.Kind kind = ContentView.kindFor(name, data);
+            String text;
+            if (hexViewCheck.isSelected() || kind == ContentView.Kind.HEX) {
+                text = ContentView.hexDump(data);
+            } else if (kind == ContentView.Kind.PETSCII) {
+                text = ContentView.petsciiToAscii(data);
+            } else {
+                text = ContentView.asUtf8(data);
+            }
+            contentArea.setText(text);
+            contentArea.setEditable(false);
+            contentArea.setCaretPosition(0);
+            log("Ver " + name + ": " + data.length + " bytes (" +
+                    MicroFSManager.humanSize(data.length) + ", vista " + kind + ")");
+        } catch (IOException ex) {
+            showError("No se pudo leer el archivo", ex, fs.getDevice());
+        }
+    }
+
+    private void toggleEdit() {
+        if (contentArea.isEditable()) {
+            contentArea.setEditable(false);
+            editButton.setText("Editar texto");
+            return;
+        }
+        String name = selectedName();
+        if (name == null) return;
+        if (name.toUpperCase().endsWith(".PRG") || name.toUpperCase().endsWith(".BIN")) {
+            int r = JOptionPane.showConfirmDialog(this,
+                    "Este archivo parece binario. Si lo guardas como texto se perderá su contenido.\n" +
+                    "¿Editar igualmente?", "Editar binario", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+            if (r != JOptionPane.YES_OPTION) return;
+        }
+        contentArea.setEditable(true);
+        contentArea.requestFocus();
+        editButton.setText("Guardar texto");
+        log("Editando " + name + ": al guardar el texto se convertirá a bytes");
+    }
+
+    private static byte[] textToBytes(String name, String text) {
+        if (name.toUpperCase().endsWith(".PET")) {
+            return ContentView.asciiToPetscii(text);
+        }
+        return text.replace("\r\n", "\n").getBytes(StandardCharsets.UTF_8);
+    }
+
+    private void deleteSelected() {
+        String name = selectedName();
+        if (name == null) return;
+        int r = JOptionPane.showConfirmDialog(this,
+                "¿Eliminar '" + name + "'?\n\n" +
+                "La entrada se borra de la tabla; sus sectores no se reutilizan (igual que mfs_delete en el 6502).",
+                "Confirmar eliminación", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+        if (r != JOptionPane.YES_OPTION) return;
+        try {
+            journal.capture(fs.getDevice(), fs.getBaseOffset());
+            fs.delete(name);
+            dirty = true;
+            contentArea.setText("");
+            contentArea.setEditable(false);
+            editButton.setText("Editar texto");
+            refreshTable();
+            log("Eliminado " + name + " (pendiente de guardar)");
+        } catch (IOException ex) {
+            showError("No se pudo eliminar", ex, fs.getDevice());
+        }
+    }
+
+    /**
+     * Cambia el nombre de un archivo conservando su contenido y sus sectores reservados.
+     * En el formato MicroFS sólo se reescribe el nombre en la entrada de la tabla.
+     */
+    private void renameSelected() {
+        String name = selectedName();
+        if (name == null) return;
+
+        if (contentArea.isEditable()) {
+            if (!preparePendingEdits()) return;
+        }
+
+        String input = (String) JOptionPane.showInputDialog(this,
+                "Nuevo nombre (máximo " + MicroFSManager.MAX_NAME_LENGTH +
+                        " caracteres, se convertirá a mayúsculas):",
+                "Renombrar " + name,
+                JOptionPane.QUESTION_MESSAGE, null, null, name);
+        if (input == null) return;
+
+        String newName;
+        try {
+            newName = fs.sanitizeName(input);
+        } catch (IOException ex) {
+            JOptionPane.showMessageDialog(this, ex.getMessage(), "Nombre inválido", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        if (newName.equals(name)) return;
+
+        try {
+            if (fs.getDevice() != null) {
+                journal.capture(fs.getDevice(), fs.getBaseOffset());
+            }
+            fs.rename(name, newName);
+            dirty = true;
+            refreshTable();
+            log("Renombrado " + name + " → " + newName + " (pendiente de guardar)");
+        } catch (IOException ex) {
+            showError("No se pudo renombrar", ex, fs.getDevice());
+        }
+    }
+
+    // ==================== Importar / exportar ====================
+
+    private void importFiles() {
+        JFileChooser chooser = newFileChooser();
+        chooser.setMultiSelectionEnabled(true);
+        chooser.setDialogTitle("Selecciona los archivos a importar");
+        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        rememberFolder(chooser);
+        File[] files = chooser.getSelectedFiles();
+        if (files == null || files.length == 0) return;
+
+        List<File> valid = new ArrayList<>();
+        List<String> rejected = new ArrayList<>();
+        for (File f : files) {
+            if (f.length() > MicroFSManager.MAX_FILE_SIZE) {
+                rejected.add(f.getName() + " (" + MicroFSManager.humanSize(f.length()) + ")");
+            } else {
+                valid.add(f);
+            }
+        }
+        if (!rejected.isEmpty()) {
+            JOptionPane.showMessageDialog(this,
+                    "Estos archivos superan el máximo de " + MicroFSManager.MAX_FILE_SIZE + " bytes y no se importarán:\n - " +
+                    String.join("\n - ", rejected), "Aviso", JOptionPane.WARNING_MESSAGE);
+        }
+        if (valid.isEmpty()) return;
+
+        int free = MicroFSManager.MAX_ENTRIES_IN_SECTOR - fs.getFileCount();
+        long sectors = 0;
+        for (File f : valid) {
+            sectors += Math.max(1, (f.length() + 511) / 512);
+        }
+        long available = fs.freeSectors();
+        StringBuilder msg = new StringBuilder();
+        msg.append("Archivos: ").append(valid.size()).append('\n');
+        msg.append("Sectores necesarios: ").append(sectors);
+        if (available >= 0) msg.append(" | libres: ").append(available);
+        if (valid.size() > free) {
+            msg.append("\n\nAviso: sólo quedan ").append(free).append(" entradas libres de ")
+               .append(MicroFSManager.MAX_ENTRIES_IN_SECTOR).append('.');
+        }
+        if (available >= 0 && sectors > available) {
+            msg.append("\n\nAviso: no cabe todo el espacio necesario en el medio.");
+        }
+        int r = JOptionPane.showConfirmDialog(this, msg.toString(), "Importar a MicroFS",
+                JOptionPane.OK_CANCEL_OPTION, JOptionPane.QUESTION_MESSAGE);
+        if (r != JOptionPane.OK_OPTION) return;
+
+        try {
+            journal.capture(fs.getDevice(), fs.getBaseOffset());
+        } catch (IOException ex) {
+            log("No se pudo respaldar la tabla actual: " + ex.getMessage());
+        }
+
+        int ok = 0;
+        for (File f : valid) {
+            try {
+                String name = fs.sanitizeName(shortName(f.getName()));
+                byte[] data = Files.readAllBytes(f.toPath());
+                fs.writeFile(name, data);
+                log("Importado " + f.getName() + " → " + name + " (" + MicroFSManager.humanSize(data.length) + ")");
+                ok++;
+            } catch (Exception ex) {
+                log("No se pudo importar " + f.getName() + ": " + ex.getMessage());
+            }
+        }
+        dirty = ok > 0;
+        refreshTable();
+        log(ok + " archivo(s) importado(s). Usa 'Guardar cambios' para escribir en el medio.");
+    }
+
+    /** Convierte un nombre de PC a 11 caracteres conservando la extensión. */
+    static String shortName(String fileName) {
+        String name = fileName.toUpperCase();
+        if (name.length() <= MicroFSManager.MAX_NAME_LENGTH) return name;
+        String ext = "";
+        int dot = name.lastIndexOf('.');
+        if (dot > 0 && name.length() - dot <= 4) {
+            ext = name.substring(dot);
+            name = name.substring(0, dot);
+        }
+        int keep = Math.max(1, MicroFSManager.MAX_NAME_LENGTH - ext.length());
+        return name.substring(0, Math.min(name.length(), keep)) + ext;
+    }
+
+    private void exportSelected() {
+        String name = selectedName();
+        if (name == null) return;
+        JFileChooser chooser = newFileChooser();
+        chooser.setDialogTitle("Exportar archivo");
+        chooser.setSelectedFile(new File(name));
+        if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        rememberFolder(chooser);
+        try {
+            byte[] data = fs.readFile(name);
+            Files.write(chooser.getSelectedFile().toPath(), data);
+            log("Exportado " + name + " → " + chooser.getSelectedFile().getAbsolutePath());
+        } catch (IOException ex) {
+            showError("No se pudo exportar", ex, fs.getDevice());
+        }
+    }
+
+    // ==================== Guardar / formatear / deshacer ====================
+
+    private void saveChanges() {
+        String device = deviceField.getText().trim();
+        if (device.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "Indica la imagen o el dispositivo de destino.",
+                    "Aviso", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        long offset = parseBaseOffset();
+        if (offset < 0) {
+            JOptionPane.showMessageDialog(this, "El offset debe ser 0 o múltiplo de 512.",
+                    "Aviso", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
+        boolean editing = contentArea.isEditable();
+        String editingName = selectedName();
+        try {
+            if (editing && editingName != null) {
+                fs.writeFile(editingName, textToBytes(editingName, contentArea.getText()));
+                contentArea.setEditable(false);
+                editButton.setText("Editar texto");
+            }
+            // En Windows puede ser necesario escribir por la unidad montada (\\.\F:)
+            // cuando \\.\PhysicalDriveN no admite acceso directo.
+            String target = DevicePaths.resolve(device, null);
+            if (!target.equals(fs.getDevice()) || fs.getBaseOffset() != offset) {
+                fs.setTarget(target, offset);
+            }
+            File backup = backupBeforeSave(target);
+            boolean rebuilt = fs.flush();
+            dirty = false;
+            journal.clear();
+            fs.mount(target, offset);
+            refreshTable();   // también actualiza la barra de estado
+            log("Cambios guardados en " + target + " (" + fs.getFileCount() + " archivo(s))");
+            if (rebuilt) {
+                log("Aviso: fue necesario reasignar sectores (recompactar) para que cupiera algún archivo.");
+            }
+            String backupText = backup == null ? "" : "\n\nCopia de seguridad de los datos anteriores:\n"
+                    + backup.getAbsolutePath();
+            JOptionPane.showMessageDialog(this,
+                    "Cambios guardados en el medio.\nSe recomienda expulsar la tarjeta antes de retirarla."
+                            + backupText,
+                    "Guardar", JOptionPane.INFORMATION_MESSAGE);
+        } catch (IOException ex) {
+            showError("No se pudieron guardar los cambios", ex, device);
+        }
+    }
+
+    /**
+     * Guarda una copia del sector 0 y del área de datos usada antes de escribir en el medio.
+     * Las copias van a una carpeta del PC, nunca a la tarjeta. Si el usuario decide no
+     * hacer copias, se guarda sin ellas.
+     */
+    private File backupBeforeSave(String device) {
+        if (backupsDisabled) return null;
+        if (!showBackups()) {
+            int r = JOptionPane.showConfirmDialog(this,
+                    "Antes de escribir en la tarjeta se guarda una copia de seguridad\n" +
+                    "del área usada por MicroFS, por si hay que recuperar un guardado erróneo.\n\n" +
+                    "¿Deseas crear copias de seguridad antes de cada guardado?",
+                    "Copias de seguridad", JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
+            if (r != JOptionPane.YES_OPTION) {
+                backupsDisabled = true;
+                log("Copias de seguridad desactivadas para esta sesión");
+                return null;
+            }
+            backupChooser = chooseBackupFolder();
+            if (backupChooser == null) {
+                backupChooser = defaultBackupFolder();
+            }
+        }
+        if (backupChooser == null) return null;
+        try {
+            byte[] table = new byte[MicroFSManager.SECTOR_SIZE];
+            DeviceAccess.read(device, fs.getBaseOffset(), table, MicroFSManager.SECTOR_SIZE);
+            byte[] data = fs.snapshotUsedArea();
+            byte[] all = new byte[table.length + data.length];
+            System.arraycopy(table, 0, all, 0, table.length);
+            System.arraycopy(data, 0, all, table.length, data.length);
+
+            String stamp = backupFormat.format(new java.util.Date());
+            File file = new File(backupChooser, "microfs_" + stamp + ".bak");
+            Files.write(file.toPath(), all);
+            log("Copia de seguridad: " + file.getAbsolutePath() + " (" + MicroFSManager.humanSize(all.length) + ")");
+            return file;
+        } catch (IOException ex) {
+            log("No se pudo crear la copia de seguridad: " + ex.getMessage());
+            return null;
+        }
+    }
+
+    /** Carpeta usada por defecto: <usuario>\\MicroFS Backups, creada si no existe. */
+    private File defaultBackupFolder() {
+        File folder = new File(System.getProperty("user.home", "."), "MicroFS Backups");
+        if (!folder.isDirectory() && !folder.mkdirs()) {
+            log("No se pudo crear " + folder.getAbsolutePath() + "; no se harán copias.");
+            return null;
+        }
+        saveBackupFolder(folder);
+        return folder;
+    }
+
+    private void saveBackupFolder(File folder) {
+        Preferences prefs = Preferences.userNodeForPackage(MicroFSBrowser.class);
+        prefs.put(BACKUP_PREF, folder.getAbsolutePath());
+    }
+
+    private File chooseBackupFolder() {
+        JFileChooser chooser = newFileChooser();
+        chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+        chooser.setDialogTitle("Carpeta para las copias de seguridad de la tarjeta");
+        if (chooser.showDialog(this, "Usar esta carpeta") != JFileChooser.APPROVE_OPTION) return null;
+        File folder = chooser.getSelectedFile();
+        saveBackupFolder(folder);
+        return folder;
+    }
+
+    private boolean showBackups() {
+        if (backupChooser != null) return true;
+        String saved = Preferences.userNodeForPackage(MicroFSBrowser.class).get(BACKUP_PREF, "");
+        if (saved.isEmpty()) return false;
+        File folder = new File(saved);
+        if (!folder.isDirectory()) return false;
+        backupChooser = folder;
+        return true;
+    }
+
+    private void formatMedium() {
+        String device = deviceField.getText().trim();
+        if (device.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "Indica la imagen o el dispositivo a formatear.",
+                    "Aviso", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+        long offset = Math.max(0, parseBaseOffset());
+        int r = JOptionPane.showConfirmDialog(this,
+                "¿Formatear este medio con MicroFS?\n\n" + device + "\n\n" +
+                "Se escribirá una tabla de archivos vacía. Los datos anteriores dejan de ser accesibles.",
+                "Confirmar formateo", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+        if (r != JOptionPane.YES_OPTION) return;
+
+        try {
+            if (fs.getDevice() != null) {
+                journal.capture(fs.getDevice(), fs.getBaseOffset());
+            }
+            fs.setTarget(device, offset);
+            fs.format();
+            dirty = true;
+            contentArea.setText("");
+            contentArea.setEditable(false);
+            editButton.setText("Editar texto");
+            refreshTable();
+            log("Medio formateado en memoria. Pulsa 'Guardar cambios' para aplicarlo.");
+            JOptionPane.showMessageDialog(this,
+                    "Formateo preparado.\nPulsa 'Guardar cambios' para escribir la tabla vacía en el medio.",
+                    "Formatear", JOptionPane.INFORMATION_MESSAGE);
+        } catch (IOException ex) {
+            showError("No se pudo formatear", ex, device);
+        }
+    }
+
+    private void undoChanges() {
+        if (!journal.isCaptured()) {
+            JOptionPane.showMessageDialog(this, "No hay operaciones para deshacer.",
+                    "Deshacer", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        int r = JOptionPane.showConfirmDialog(this,
+                "¿Descartar los cambios no guardados y volver al estado anterior?",
+                "Deshacer", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+        if (r != JOptionPane.YES_OPTION) return;
+        try {
+            String device = fs.getDevice();
+            if (device != null) {
+                journal.rollback(device, fs.getBaseOffset());
+                fs.mount(device, fs.getBaseOffset());
+            } else {
+                fs.newMedium();
+            }
+            dirty = false;
+            journal.clear();
+            contentArea.setText("");
+            contentArea.setEditable(false);
+            editButton.setText("Editar texto");
+            refreshTable();
+            log("Cambios descartados");
+        } catch (IOException ex) {
+            showError("No se pudo deshacer", ex, fs.getDevice());
+        }
+    }
+
+    /** Aplica al modelo la edición de texto pendiente para no perderla al cambiar de contexto. */
+    private boolean preparePendingEdits() {
+        if (!contentArea.isEditable()) return true;
+        String name = selectedName();
+        if (name == null) {
+            contentArea.setEditable(false);
+            editButton.setText("Editar texto");
+            return true;
+        }
+        try {
+            fs.writeFile(name, textToBytes(name, contentArea.getText()));
+            dirty = true;
+            contentArea.setEditable(false);
+            editButton.setText("Editar texto");
+            log("Edición de " + name + " aplicada en memoria");
+            return true;
+        } catch (IOException ex) {
+            showError("No se pudo aplicar la edición", ex, fs.getDevice());
+            return false;
+        }
+    }
+
+    private boolean confirmDiscard() {
+        if (!dirty) return true;
+        String device = fs.getDevice();
+        if (device != null && journal.isCaptured()) {
+            int r = JOptionPane.showConfirmDialog(this,
+                    "Hay cambios sin guardar en memoria.\n\n" +
+                    "Sí = descartarlos y recuperar la tabla que tenía el medio\n" +
+                    "No = perder los cambios sin escribir nada\n" +
+                    "Cancelar = volver a la aplicación",
+                    "Cambios sin guardar", JOptionPane.YES_NO_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE);
+            if (r == JOptionPane.CANCEL_OPTION || r == JOptionPane.CLOSED_OPTION) return false;
+            if (r == JOptionPane.YES_OPTION) {
+                try {
+                    journal.rollback(device, fs.getBaseOffset());
+                } catch (IOException ex) {
+                    showError("No se pudo recuperar la tabla anterior", ex, device);
+                    return false;
+                }
+            }
+            journal.clear();
+            dirty = false;
+            return true;
+        }
+        int r = JOptionPane.showConfirmDialog(this,
+                "Hay cambios sin guardar. ¿Descartarlos?",
+                "Cambios sin guardar", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+        if (r != JOptionPane.YES_OPTION) return false;
+        dirty = false;
+        journal.clear();
+        return true;
+    }
+
+    private void showError(String title, Exception ex, String device) {
+        log(title + ": " + ex.getMessage());
+        StringBuilder msg = new StringBuilder(title).append(":\n\n").append(ex.getMessage());
+        if (device != null && DeviceAccess.isPhysical(device)) {
+            msg.append("\n\nEjecuta la aplicación como Administrador y cierra los programas que usen la tarjeta.");
+        }
+        JOptionPane.showMessageDialog(this, msg.toString(), "Error", JOptionPane.ERROR_MESSAGE);
+    }
+
     // ==================== Main ====================
-    
+
     public static void main(String[] args) {
-        SwingUtilities.invokeLater(() -> {
-            MicroFSBrowser browser = new MicroFSBrowser();
-            browser.setVisible(true);
-        });
+        SwingUtilities.invokeLater(() -> new MicroFSBrowser().setVisible(true));
     }
 }

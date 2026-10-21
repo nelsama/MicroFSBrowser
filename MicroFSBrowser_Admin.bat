@@ -1,6 +1,6 @@
 @echo off
-:: Script para ejecutar MicroFS Browser como Administrador
-:: Solicita elevación automáticamente
+:: Ejecuta MicroFS Browser con privilegios de administrador.
+:: Necesario para abrir discos fisicos (\\.\PhysicalDriveN). Con imagenes .img no hace falta.
 
 >nul 2>&1 "%SYSTEMROOT%\system32\cacls.exe" "%SYSTEMROOT%\system32\config\system"
 
@@ -25,6 +25,18 @@ echo   MicroFS Browser - Modo Administrador
 echo ============================================
 echo.
 
+if not exist "MicroFSBrowser.jar" (
+    echo ERROR: No se encontro MicroFSBrowser.jar.
+    echo Ejecuta primero run.bat como usuario normal.
+    echo.
+    pause
+    exit /b 1
+)
+
 java -jar MicroFSBrowser.jar
 
+if not %ERRORLEVEL% == 0 (
+    echo.
+    echo La aplicacion termino con error ^(%ERRORLEVEL%^).
+)
 pause

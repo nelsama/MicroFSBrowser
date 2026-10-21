@@ -1,18 +1,18 @@
 #!/bin/bash
-# Script para compilar y ejecutar MicroFS Browser en Linux/Mac
+# Compila y ejecuta MicroFS Browser en Linux/macOS
 # Requiere JDK 8 o superior
 
 echo "Compilando MicroFS Browser..."
 
 mkdir -p bin
 
-javac -d bin -sourcepath src src/microfs/MicroFSBrowser.java
+javac -encoding UTF-8 -d bin -sourcepath src src/microfs/*.java
 
 if [ $? -eq 0 ]; then
     echo "Compilación exitosa!"
     echo ""
     echo "Ejecutando MicroFS Browser..."
-    echo "NOTA: Para acceder a dispositivos físicos, ejecuta con sudo"
+    echo "NOTA: para abrir dispositivos físicos (/dev/sdX) ejecuta con sudo"
     echo ""
     java -cp bin microfs.MicroFSBrowser
 else
