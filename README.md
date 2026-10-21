@@ -112,6 +112,31 @@ Sector 1+: datos de los archivos, en orden y contiguos
 La vista elige automáticamente texto, hexadecimal o PETSCII según la extensión
 (`.PET`) y el contenido; la casilla **Vista hexadecimal** fuerza el volcado.
 
+## Copiar la tarjeta a imagen y grabar imagen en tarjeta
+
+En el menú **Imagen** hay tres operaciones sobre el medio completo, como Win32DiskImager:
+
+| Menú | Qué hace |
+|---|---|
+| **Copiar tarjeta a imagen…** | Copia byte a byte el medio seleccionado (o la imagen abierta) a un archivo `.img` |
+| **Grabar imagen en tarjeta…** | Escribe una imagen `.img` completa en el dispositivo, como al grabar un pendrive |
+| **Verificar dispositivo con imagen…** | Compara el dispositivo con una imagen, byte a byte |
+
+Comportamiento:
+
+- Barra de progreso modal y verificación automática al terminar (relee y compara).
+- **Doble confirmación** antes de escribir en un dispositivo; hay que escribir `GRABAR`.
+- Se **bloquea** si el destino es el disco del sistema o `C:`.
+- Se rechaza la copia si la imagen no cabe en el destino; si el destino es mayor, los bytes
+  sobrantes no se tocan.
+- Grabar una imagen cierra el MicroFS abierto en memoria (el modelo dejaría de coincidir
+  con la tarjeta) y ofrece volver a abrirlo al terminar.
+- Copiar respeta el tamaño real del origen: una imagen pequeña no se "infla" al tamaño del
+  disco.
+
+Recomendación: antes de formatear o recompactar, usa **Copiar tarjeta a imagen…** para tener
+un respaldo recuperable con **Grabar imagen en tarjeta…**.
+
 ## Trabajar con tarjetas SD físicas
 
 ### Recomendado: usar una imagen
@@ -166,6 +191,8 @@ copia de seguridad y rechazo de guardados que no caben.
 
 ### v2.0
 
+- Menú **Imagen**: copiar tarjeta a imagen, grabar imagen en tarjeta y verificar, con
+  barra de progreso y protección del disco del sistema.
 - Compatibilidad con el formato real del driver (`FM`, 15 entradas, cabecera de 6 bytes).
 - Apertura de **imágenes de tarjeta** además de dispositivos físicos.
 - Detección de discos SD/USB con preselección de la tarjeta.

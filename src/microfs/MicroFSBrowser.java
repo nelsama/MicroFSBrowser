@@ -122,10 +122,35 @@ public class MicroFSBrowser extends JFrame {
     private void buildUi() {
         initLookAndFeel();
         setLayout(new BorderLayout(6, 6));
+        setJMenuBar(createMenuBar());
         add(createConnectionPanel(), BorderLayout.NORTH);
         add(createMainSplit(), BorderLayout.CENTER);
         add(createLogPanel(), BorderLayout.SOUTH);
         ((JPanel) getContentPane()).setBorder(new EmptyBorder(8, 8, 8, 8));
+    }
+
+    private JMenuBar createMenuBar() {
+        JMenuBar bar = new JMenuBar();
+        JMenu menu = new JMenu("Imagen");
+
+        JMenuItem backup = new JMenuItem("Copiar tarjeta a imagen…");
+        backup.setToolTipText("Guarda una copia byte a byte del dispositivo o de un archivo .img");
+        backup.addActionListener(e -> copyMediumToImage());
+
+        JMenuItem restore = new JMenuItem("Grabar imagen en tarjeta…");
+        restore.setToolTipText("Escribe una imagen .img completa en el dispositivo, como al grabar un pendrive");
+        restore.addActionListener(e -> writeImageToMedium());
+
+        JMenuItem verify = new JMenuItem("Verificar dispositivo con imagen…");
+        verify.setToolTipText("Comprueba que el dispositivo coincide byte a byte con una imagen");
+        verify.addActionListener(e -> verifyMediumAgainstImage());
+
+        menu.add(backup);
+        menu.add(restore);
+        menu.addSeparator();
+        menu.add(verify);
+        bar.add(menu);
+        return bar;
     }
 
     private JPanel createConnectionPanel() {
@@ -1024,6 +1049,210 @@ public class MicroFSBrowser extends JFrame {
         } catch (IOException ex) {
             showError("No se pudo exportar", ex, fs.getDevice());
         }
+    }
+
+    // ==================== Copias completas del medio ====================
+
+    /** Dispositivo seleccionado en el campo de medio, o null si es una imagen. */
+    private String selectedDevice() {
+        String text = deviceField.getText().trim();
+        if (text.isEmpty()) return null;
+        String resolved = DevicePaths.resolve(text, null);
+        if (DeviceAccess.isWindowsDevice(resolved) || resolved.startsWith(DeviceAccess.isWindows() ? "\\\\.\\" : "/dev/")) {
+            return resolved;
+        }
+        return null;
+    }
+
+    private void showImageMenuHint() {
+        JOptionPane.showMessageDialog(this,
+                "Estas operaciones trabajan con dispositivos físicos (tarjeta SD).\n" +
+                "Elige la tarjeta en 'Discos detectados' o escribe \\\\.\\PhysicalDriveN / /dev/sdX.",
+                "Imagen", JOptionPane.INFORMATION_MESSAGE);
+    }
+
+    /** Tarjeta (o imagen abierta) -> archivo .img. */
+    private void copyMediumToImage() {
+        String source = deviceField.getText().trim();
+        if (source.isEmpty()) {
+            showImageMenuHint();
+            return;
+        }
+        String resolved = DevicePaths.resolve(source, null);
+
+        JFileChooser chooser = newFileChooser();
+        chooser.setDialogTitle("Guardar copia del medio como imagen");
+        chooser.setSelectedFile(new File("sd_backup.img"));
+        if (chooser.showSaveDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        rememberFolder(chooser);
+        File target = ensureExtension(chooser.getSelectedFile());
+
+        try {
+            MediumImager.Plan plan = MediumImager.plan(resolved, target.getAbsolutePath());
+            int confirm = JOptionPane.showConfirmDialog(this,
+                    "Se copiará el medio completo:\n\n" +
+                    "Origen:  " + resolved + "\n" +
+                    "Destino: " + target.getAbsolutePath() + "\n" +
+                    "Tamaño:  " + MicroFSManager.humanSize(plan.sourceSize) +
+                    (plan.notes.isEmpty() ? "" : "\n\n" + plan.notes),
+                    "Copiar a imagen", JOptionPane.OK_CANCEL_OPTION, JOptionPane.QUESTION_MESSAGE);
+            if (confirm != JOptionPane.OK_OPTION) return;
+
+            runCopy(resolved, target.getAbsolutePath(), true,
+                    "Copiando " + resolved + " a imagen");
+            log("Imagen creada: " + target.getAbsolutePath());
+        } catch (IOException ex) {
+            showError("No se pudo copiar el medio", ex, resolved);
+        }
+    }
+
+    /** Archivo .img -> tarjeta (como grabar un pendrive). */
+    private void writeImageToMedium() {
+        String device = selectedDevice();
+        if (device == null) {
+            showImageMenuHint();
+            return;
+        }
+
+        JFileChooser chooser = newFileChooser();
+        chooser.setDialogTitle("Elegir imagen para grabar");
+        chooser.setFileFilter(new FileNameExtensionFilter("Imágenes de tarjeta SD (*.img, *.bin, *.dsk, *.raw)", IMAGE_FILTER));
+        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        rememberFolder(chooser);
+        File image = chooser.getSelectedFile();
+
+        try {
+            MediumImager.Plan plan = MediumImager.plan(image.getAbsolutePath(), device);
+            String texto = "Se SOBRESCRIBIRÁ el contenido del dispositivo:\n\n" +
+                    "Destino: " + device +
+                    (plan.targetSize > 0 ? " (" + MicroFSManager.humanSize(plan.targetSize) + ")" : "") + "\n" +
+                    "Imagen:  " + image.getAbsolutePath() + "\n" +
+                    "Tamaño:  " + MicroFSManager.humanSize(plan.sourceSize) +
+                    (plan.notes.isEmpty() ? "" : "\n\n" + plan.notes) +
+                    "\n\nTodos los datos actuales del dispositivo se perderán.";
+            int confirm = JOptionPane.showConfirmDialog(this, texto,
+                    "Grabar imagen en el dispositivo", JOptionPane.OK_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE);
+            if (confirm != JOptionPane.OK_OPTION) return;
+
+            String typed = JOptionPane.showInputDialog(this,
+                    "Escribe GRABAR para confirmar la escritura en " + device + ":", "Confirmar");
+            if (typed == null || !typed.trim().equalsIgnoreCase("GRABAR")) {
+                log("Grabación cancelada");
+                return;
+            }
+
+            // El modelo en memoria dejaría de coincidir con el medio
+            if (fs.isMounted()) {
+                fs.close();
+                dirty = false;
+                journal.clear();
+            }
+
+            runCopy(image.getAbsolutePath(), device, true,
+                    "Grabando imagen en " + device);
+            log("Imagen grabada en " + device);
+
+            int abrir = JOptionPane.showConfirmDialog(this,
+                    "Imagen grabada correctamente.\n¿Abrir MicroFS del dispositivo ahora?",
+                    "Grabar imagen", JOptionPane.YES_NO_OPTION, JOptionPane.QUESTION_MESSAGE);
+            if (abrir == JOptionPane.YES_OPTION) openMedium();
+        } catch (IOException ex) {
+            showError("No se pudo grabar la imagen", ex, device);
+        }
+    }
+
+    /** Compara el dispositivo con una imagen, byte a byte. */
+    private void verifyMediumAgainstImage() {
+        String device = selectedDevice();
+        if (device == null) {
+            showImageMenuHint();
+            return;
+        }
+        JFileChooser chooser = newFileChooser();
+        chooser.setDialogTitle("Imagen con la que comparar");
+        chooser.setFileFilter(new FileNameExtensionFilter("Imágenes de tarjeta SD (*.img, *.bin, *.dsk, *.raw)", IMAGE_FILTER));
+        if (chooser.showOpenDialog(this) != JFileChooser.APPROVE_OPTION) return;
+        rememberFolder(chooser);
+        File image = chooser.getSelectedFile();
+
+        try {
+            long size = Files.size(image.toPath());
+            boolean resultado = runWithProgress("Verificando " + device, progress -> {
+                MediumImager.verifyCopy(image.getAbsolutePath(), device, size);
+                return true;
+            });
+            if (resultado) {
+                log("Verificación correcta: " + device + " coincide con " + image.getName());
+                JOptionPane.showMessageDialog(this, "El dispositivo coincide con la imagen.",
+                        "Verificación", JOptionPane.INFORMATION_MESSAGE);
+            }
+        } catch (IOException ex) {
+            showError("La verificación falló", ex, device);
+        }
+    }
+
+    private interface CopyTask {
+        boolean run(java.util.function.DoubleConsumer progress) throws IOException;
+    }
+
+    /** Ejecuta una tarea con barra de progreso modal y devuelve true si terminó bien. */
+    private boolean runWithProgress(String title, CopyTask task) throws IOException {
+        JDialog dialog = new JDialog(this, title, true);
+        JProgressBar bar = new JProgressBar(0, 1000);
+        bar.setStringPainted(true);
+        bar.setString("0 %");
+        dialog.add(BorderLayout.CENTER, bar);
+        dialog.add(BorderLayout.SOUTH, new JLabel(" No cierres esta ventana ni retires la tarjeta",
+                SwingConstants.CENTER));
+        dialog.setSize(420, 110);
+        dialog.setLocationRelativeTo(this);
+
+        final boolean[] ok = new boolean[1];
+        final IOException[] error = new IOException[1];
+        Thread worker = new Thread(() -> {
+            try {
+                ok[0] = task.run(progress -> {
+                    int value = (int) Math.round(progress * 1000);
+                    SwingUtilities.invokeLater(() -> {
+                        bar.setValue(value);
+                        bar.setString((value / 10) + " %");
+                    });
+                });
+            } catch (IOException ex) {
+                error[0] = ex;
+            }
+        }, "microfs-copy");
+        worker.start();
+
+        Thread watcher = new Thread(() -> {
+            try {
+                worker.join();
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            SwingUtilities.invokeLater(dialog::dispose);
+        }, "microfs-copy-watch");
+        watcher.start();
+
+        dialog.setVisible(true); // modal hasta que el watcher la cierre
+        try {
+            worker.join();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (error[0] != null) throw error[0];
+        return ok[0];
+    }
+
+    private void runCopy(String source, String target, boolean verify, String title) throws IOException {
+        long t0 = System.currentTimeMillis();
+        runWithProgress(title, progress -> {
+            MediumImager.copy(source, target, verify, progress);
+            return true;
+        });
+        long ms = System.currentTimeMillis() - t0;
+        log(String.format("%s -> %s completado en %.1f s%s", source, target, ms / 1000.0,
+                verify ? " (verificado)" : ""));
     }
 
     // ==================== Guardar / formatear / deshacer ====================

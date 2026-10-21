@@ -32,6 +32,7 @@ public final class MicroFSSelfTest {
         testUndoJournal(img);
         testRename(img);
         testPositionsPreserved(img);
+        testImager(img, dir);
 
         System.out.println();
         System.out.println("Pruebas OK: " + passed + " | Fallidas: " + failed);
@@ -278,6 +279,56 @@ public final class MicroFSSelfTest {
         for (MicroFSManager.Entry e : m.list()) out.add(e.getStartSector());
         java.util.Collections.sort(out);
         return out;
+    }
+
+    /** Copia completa entre imágenes, verificación y rechazos. */
+    private static void testImager(Path img, Path dir) throws IOException {
+        Path origen = dir.resolve("origen.img");
+        Path destino = dir.resolve("destino.img");
+        byte[] contenido = new byte[512 * 8];
+        for (int i = 0; i < contenido.length; i++) contenido[i] = (byte) (i * 7);
+        Files.write(origen, contenido);
+
+        MediumImager.Plan plan = MediumImager.plan(origen.toString(), destino.toString());
+        check("imagen: tamaño detectado", plan.sourceSize == contenido.length);
+        check("imagen: el tamaño no se confunde con un disco",
+                MediumImager.deviceSize(origen.toString()) == contenido.length);
+
+        MediumImager.copy(origen.toString(), destino.toString(), true, null);
+        check("imagen: copia íntegra y verificada", Arrays.equals(contenido, Files.readAllBytes(destino)));
+
+        // Sobrescribe sin dejar restos si el destino era mayor
+        Files.write(destino, new byte[512 * 20]);
+        MediumImager.copy(origen.toString(), destino.toString(), true, null);
+        check("imagen: el destino queda del tamaño del origen",
+                Files.size(destino) == contenido.length);
+
+        // Verificación detecta diferencias
+        byte[] alterado = Files.readAllBytes(destino);
+        alterado[100] ^= 0xFF;
+        Files.write(destino, alterado);
+        try {
+            MediumImager.verifyCopy(origen.toString(), destino.toString(), contenido.length);
+            check("verificación detecta diferencias", false);
+        } catch (MediumImager.CopyException ex) {
+            check("verificación detecta diferencias", ex.getMessage().contains("byte 100"));
+        }
+
+        // Origen inexistente
+        try {
+            MediumImager.plan(dir.resolve("noexiste.img").toString(), destino.toString());
+            check("rechaza origen inexistente", false);
+        } catch (MediumImager.CopyException ex) {
+            check("rechaza origen inexistente", ex.getMessage().contains("No existe el origen"));
+        }
+
+        // Origen y destino iguales
+        try {
+            MediumImager.plan(origen.toString(), origen.toString());
+            check("rechaza origen = destino", false);
+        } catch (MediumImager.CopyException ex) {
+            check("rechaza origen = destino", ex.getMessage().contains("mismo medio"));
+        }
     }
 
     // ==================== Utilidades ====================
