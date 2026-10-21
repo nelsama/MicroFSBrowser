@@ -96,6 +96,9 @@ Sector 1+: datos de los archivos, en orden y contiguos
    carpeta usada** entre sesiones.
    *Renombrar* también está disponible con **F2** sobre el archivo seleccionado: cambia el
    nombre en la tabla sin mover los datos ni la reserva de sectores.
+   **Editar texto** abre el contenido real del archivo para editarlo (no el volcado
+   hexadecimal) y el botón cambia a **Aplicar texto**: al pulsarlo los cambios quedan en
+   memoria y hay que pulsar **Guardar cambios** para escribirlos en el medio.
 5. **Guardar cambios**: escribe en el medio sólo lo que cambió. Se **respetan las
    posiciones originales** de los archivos (renombrar, borrar o editar sin crecer no mueve
    nada); sólo si un archivo no cabe en su reserva se reasigna el reparto de sectores, y se

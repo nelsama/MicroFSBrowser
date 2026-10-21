@@ -70,6 +70,8 @@ public class MicroFSBrowser extends JFrame {
     private final List<String> rowNames = new ArrayList<>();
     private boolean dirty;
     private boolean selectingFromCode;
+    /** Nombre del archivo cuya edición de texto está abierta (null si no hay). */
+    private String editingName;
 
     private static final class DiskItem {
         final String label;
@@ -758,6 +760,7 @@ public class MicroFSBrowser extends JFrame {
         String name = selectedName();
         if (name == null) return;
         try {
+            if (name.equals(editingName)) cerrarEdicion();
             byte[] data = fs.readFile(name);
             ContentView.Kind kind = ContentView.kindFor(name, data);
             String text;
@@ -769,7 +772,6 @@ public class MicroFSBrowser extends JFrame {
                 text = ContentView.asUtf8(data);
             }
             contentArea.setText(text);
-            contentArea.setEditable(false);
             contentArea.setCaretPosition(0);
             log("Ver " + name + ": " + data.length + " bytes (" +
                     MicroFSManager.humanSize(data.length) + ", vista " + kind + ")");
@@ -778,12 +780,25 @@ public class MicroFSBrowser extends JFrame {
         }
     }
 
+    /**
+     * Alterna la edición del archivo seleccionado.
+     *
+     * Al entrar en edición se siembra el área con el contenido real del archivo ("Ver"
+     * muestra un volcado hexadecimal para binarios, que no debe guardarse como texto).
+     * Al salir, el texto se aplica al modelo en memoria; "Guardar cambios" lo escribe en
+     * el medio.
+     */
     private void toggleEdit() {
         if (contentArea.isEditable()) {
-            contentArea.setEditable(false);
-            editButton.setText("Editar texto");
+            if (aplicarEdicion()) {
+                JOptionPane.showMessageDialog(this,
+                        "Cambios aplicados en memoria.\n" +
+                        "Pulsa 'Guardar cambios' para escribirlos en el medio.",
+                        "Edición", JOptionPane.INFORMATION_MESSAGE);
+            }
             return;
         }
+
         String name = selectedName();
         if (name == null) return;
         if (name.toUpperCase().endsWith(".PRG") || name.toUpperCase().endsWith(".BIN")) {
@@ -792,10 +807,51 @@ public class MicroFSBrowser extends JFrame {
                     "¿Editar igualmente?", "Editar binario", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
             if (r != JOptionPane.YES_OPTION) return;
         }
-        contentArea.setEditable(true);
-        contentArea.requestFocus();
-        editButton.setText("Guardar texto");
-        log("Editando " + name + ": al guardar el texto se convertirá a bytes");
+        try {
+            byte[] data = fs.readFile(name);
+            boolean petscii = name.toUpperCase().endsWith(".PET");
+            boolean binario = ContentView.kindFor(name, data) == ContentView.Kind.HEX;
+            String text = petscii ? ContentView.petsciiToAscii(data) : ContentView.asUtf8(data);
+            contentArea.setText(text);
+            contentArea.setEditable(true);
+            contentArea.setCaretPosition(0);
+            contentArea.requestFocus();
+            editingName = name;
+            editButton.setText("Aplicar texto");
+            log("Editando " + name + " (" + data.length + " bytes" +
+                    (binario ? ", contenido binario" : "") +
+                    "): al aplicar se convertirá el texto a bytes");
+        } catch (IOException ex) {
+            showError("No se pudo abrir el archivo para editar", ex, fs.getDevice());
+        }
+    }
+
+    /** Escribe en el modelo el texto editado. Devuelve true si se aplicó. */
+    private boolean aplicarEdicion() {
+        String name = editingName != null ? editingName : selectedName();
+        if (name == null) {
+            cerrarEdicion();
+            return false;
+        }
+        try {
+            byte[] data = textToBytes(name, contentArea.getText());
+            fs.writeFile(name, data);
+            dirty = true;
+            cerrarEdicion();
+            refreshTable();
+            log("Edición aplicada en memoria: " + name + " (" + data.length + " bytes)");
+            return true;
+        } catch (IOException ex) {
+            showError("No se pudo aplicar la edición", ex, fs.getDevice());
+            return false;
+        }
+    }
+
+    private void cerrarEdicion() {
+        editingName = null;
+        contentArea.setEditable(false);
+        editButton.setText("Editar texto");
+        updateButtonStates();
     }
 
     private static byte[] textToBytes(String name, String text) {
@@ -986,14 +1042,8 @@ public class MicroFSBrowser extends JFrame {
             return;
         }
 
-        boolean editing = contentArea.isEditable();
-        String editingName = selectedName();
         try {
-            if (editing && editingName != null) {
-                fs.writeFile(editingName, textToBytes(editingName, contentArea.getText()));
-                contentArea.setEditable(false);
-                editButton.setText("Editar texto");
-            }
+            if (contentArea.isEditable() && !aplicarEdicion()) return;
             // En Windows puede ser necesario escribir por la unidad montada (\\.\F:)
             // cuando \\.\PhysicalDriveN no admite acceso directo.
             String target = DevicePaths.resolve(device, null);
@@ -1167,23 +1217,7 @@ public class MicroFSBrowser extends JFrame {
     /** Aplica al modelo la edición de texto pendiente para no perderla al cambiar de contexto. */
     private boolean preparePendingEdits() {
         if (!contentArea.isEditable()) return true;
-        String name = selectedName();
-        if (name == null) {
-            contentArea.setEditable(false);
-            editButton.setText("Editar texto");
-            return true;
-        }
-        try {
-            fs.writeFile(name, textToBytes(name, contentArea.getText()));
-            dirty = true;
-            contentArea.setEditable(false);
-            editButton.setText("Editar texto");
-            log("Edición de " + name + " aplicada en memoria");
-            return true;
-        } catch (IOException ex) {
-            showError("No se pudo aplicar la edición", ex, fs.getDevice());
-            return false;
-        }
+        return aplicarEdicion();
     }
 
     private boolean confirmDiscard() {
