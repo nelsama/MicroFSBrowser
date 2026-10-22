@@ -103,17 +103,24 @@ final class MediumImager {
             throws IOException {
         Plan plan = plan(source, target);
 
-        boolean sourcePwsh = needsPowershell(source);
-        boolean targetPwsh = plan.targetIsDevice && needsPowershell(target);
+        if (plan.targetIsDevice) {
+            copyToDevice(source, target, plan, progress);
+        } else {
+            copyToFile(source, target, plan, progress);
+        }
 
-        if (!plan.targetIsDevice && sourcePwsh) {
-            // Dispositivo -> archivo: un solo proceso copia todo el medio.
-            copyDeviceToFile(source, target, plan.sourceSize, progress);
-        } else if (plan.targetIsDevice && targetPwsh) {
-            // Archivo -> dispositivo: un solo proceso escribe todo.
-            if (!sourcePwsh) {
-                copyFileToDevice(source, target, plan.sourceSize, progress);
-            } else {
+        if (verify) {
+            verifyCopy(source, target, plan.sourceSize, progress);
+        }
+    }
+
+    /** Destino = dispositivo físico: siempre se escribe con PowerShell. */
+    private static void copyToDevice(String source, String target, Plan plan, DoubleConsumer progress)
+            throws IOException {
+        DeviceAccess.ensureWindowsWritable(target);
+
+        if (usesPowershell(source)) {
+            if (usesPowershell(target)) {
                 // Dispositivo -> dispositivo: pasar por un archivo temporal.
                 Path tmp = Files.createTempFile("microfs_img", ".tmp");
                 try {
@@ -122,25 +129,42 @@ final class MediumImager {
                 } finally {
                     Files.deleteIfExists(tmp);
                 }
+            } else {
+                // Si el destino no se puede abrir con Java, se escribe por PowerShell igualmente.
+                copyFileToDevice(source, target, plan.sourceSize, progress);
             }
+            return;
+        }
+
+        // Origen = imagen: se escribe todo en un proceso si el destino exige PowerShell.
+        if (usesPowershell(target)) {
+            copyFileToDevice(source, target, plan.sourceSize, progress);
         } else {
             copyWithJava(source, target, plan, progress);
         }
+    }
 
-        if (verify) {
-            verifyCopy(source, target, plan.sourceSize, progress);
+    /** Destino = archivo .img: lectura del medio por PowerShell si hace falta. */
+    private static void copyToFile(String source, String target, Plan plan, DoubleConsumer progress)
+            throws IOException {
+        if (usesPowershell(source)) {
+            copyDeviceToFile(source, target, plan.sourceSize, progress);
+        } else {
+            copyWithJava(source, target, plan, progress);
         }
     }
 
-    /** true si Windows impide abrir la ruta con Java y hay que usar PowerShell. */
-    private static boolean needsPowershell(String path) {
-        if (!DeviceAccess.isWindowsDevice(path)) return false;
-        try {
-            new RandomAccessFile(path, "r").close();
-            return false;
-        } catch (IOException ex) {
-            return true;
-        }
+    /**
+     * True si hay que usar PowerShell para este medio.
+     *
+     * Windows nunca permite abrir un disco físico ni un volumen crudo con Java, así que
+     * cualquier ruta \\.\… o \\?\… va por PowerShell. No se sondea con RandomAccessFile porque
+     * algunos volúmenes se abren de forma intermitente (o con parámetros no válidos) y daba
+     * lugar a intentos con Java que fallaban con "El parámetro no es correcto".
+     */
+    private static boolean usesPowershell(String path) {
+        if (DeviceAccess.isWindowsDevice(path)) return true;
+        return !DeviceAccess.isWindows() && path.startsWith("/dev/");
     }
 
     /** Copia directa con Java (imágenes, o cuando el dispositivo sí se puede abrir). */
@@ -165,6 +189,12 @@ final class MediumImager {
         }
     }
 
+    /** Ruta de archivo lista para incrustar en un script PowerShell (normalizada y escapada). */
+    private static String psPath(String path) throws IOException {
+        String canonical = new java.io.File(path).getCanonicalPath();
+        return DeviceAccess.Powershell.q(canonical);
+    }
+
     /**
      * Dispositivo -> archivo en un solo proceso PowerShell.
      * El script lee el medio y escribe el archivo; la JVM solo vigila el tamaño resultante.
@@ -182,7 +212,7 @@ final class MediumImager {
                 "$ErrorActionPreference='Stop'; " +
                 "try { " +
                 "  $src=[System.IO.File]::Open('" + DeviceAccess.Powershell.q(device) + "', 'Open', 'Read', 'ReadWrite'); " +
-                "  $dst=[System.IO.File]::Create('" + DeviceAccess.Powershell.q(file.getAbsolutePath()) + "'); " +
+                "  $dst=[System.IO.File]::Create('" + psPath(target) + "'); " +
                 "  $buf=New-Object byte[] (4MB); $left=" + total + "; " +
                 "  while ($left -gt 0) { " +
                 "    $want=[Math]::Min($buf.Length, $left); " +
@@ -207,12 +237,17 @@ final class MediumImager {
             DeviceAccess.ensureWindowsWritable(device);
         }
         String script =
-                "$ErrorActionPreference='Stop'; " +
                 "try { " +
-                "  $bytes=[System.IO.File]::ReadAllBytes('" + DeviceAccess.Powershell.q(new java.io.File(source).getAbsolutePath()) + "'); " +
+                "  $src=[System.IO.File]::OpenRead('" + psPath(source) + "'); " +
                 "  $dst=[System.IO.File]::Open('" + DeviceAccess.Powershell.q(device) + "', 'Open', 'Write', 'ReadWrite'); " +
-                "  $dst.Write($bytes, 0, $bytes.Length); $dst.Flush($true); $dst.Close(); " +
-                "  Write-Output $bytes.Length; " +
+                "  $buf=New-Object byte[] (4MB); $total=[long]0; $n=0; " +
+                "  do { " +
+                "    $n=$src.Read($buf, 0, $buf.Length); " +
+                "    if ($null -eq $n) { break } " +
+                "    if ($n -gt 0) { $dst.Write($buf, 0, $n); $total += $n } " +
+                "  } while ($n -gt 0); " +
+                "  $dst.Flush($true); $dst.Close(); $src.Close(); " +
+                "  Write-Output $total " +
                 "} catch { Write-Error $_.Exception.Message; exit 1 }";
         DeviceAccess.Powershell.run(script);
         report(progress, total, total);
@@ -234,13 +269,10 @@ final class MediumImager {
     /** Relee el destino y compara con el origen, informando del progreso. */
     static void verifyCopy(String source, String target, long size, DoubleConsumer progress)
             throws IOException {
-        boolean sourcePwsh = needsPowershell(source);
-        boolean targetPwsh = needsPowershell(target);
-
-        if (sourcePwsh || targetPwsh) {
+        if (usesPowershell(source) || usesPowershell(target)) {
             // Comparar dispositivo contra archivo en un solo proceso PowerShell.
-            String device = sourcePwsh ? source : target;
-            String file = sourcePwsh ? target : source;
+            String device = usesPowershell(source) ? source : target;
+            String file = usesPowershell(source) ? target : source;
             verifyInPowershell(device, file, size, progress);
             return;
         }
@@ -278,7 +310,7 @@ final class MediumImager {
                 "$ErrorActionPreference='Stop'; " +
                 "try { " +
                 "  $dev=[System.IO.File]::Open('" + DeviceAccess.Powershell.q(device) + "', 'Open', 'Read', 'ReadWrite'); " +
-                "  $img=[System.IO.File]::OpenRead('" + DeviceAccess.Powershell.q(new java.io.File(file).getAbsolutePath()) + "'); " +
+                "  $img=[System.IO.File]::OpenRead('" + psPath(file) + "'); " +
                 "  $a=New-Object byte[] (4MB); $b=New-Object byte[] (4MB); $pos=[long]0; $left=[long]" + size + "; " +
                 "  while ($left -gt 0) { " +
                 "    $want=[int][Math]::Min($a.Length, $left); " +

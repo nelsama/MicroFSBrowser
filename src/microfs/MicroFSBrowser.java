@@ -63,6 +63,7 @@ public class MicroFSBrowser extends JFrame {
     private JButton deleteButton;
     private JButton importButton;
     private JButton exportButton;
+    private JButton exportAllButton;
     private JButton renameButton;
 
     private final MicroFSManager fs = new MicroFSManager();
@@ -238,12 +239,15 @@ public class MicroFSBrowser extends JFrame {
         renameButton.setToolTipText("Cambiar el nombre sin mover el archivo (F2)");
         importButton = new JButton("PC → SD");
         exportButton = new JButton("SD → PC");
+        exportAllButton = new JButton("Exportar todos…");
+        exportAllButton.setToolTipText("Copia todos los archivos del medio a una carpeta del PC");
         buttons.add(viewButton);
         buttons.add(editButton);
         buttons.add(renameButton);
         buttons.add(deleteButton);
         buttons.add(importButton);
         buttons.add(exportButton);
+        buttons.add(exportAllButton);
         filesPanel.add(buttons, BorderLayout.SOUTH);
 
         JPanel contentPanel = new JPanel(new BorderLayout(5, 5));
@@ -310,6 +314,7 @@ public class MicroFSBrowser extends JFrame {
         deleteButton.addActionListener(e -> deleteSelected());
         importButton.addActionListener(e -> importFiles());
         exportButton.addActionListener(e -> exportSelected());
+        exportAllButton.addActionListener(e -> exportAll());
         renameButton.addActionListener(e -> renameSelected());
         hexViewCheck.addActionListener(e -> {
             if (fileTable.getSelectedRow() >= 0) viewSelected();
@@ -374,6 +379,7 @@ public class MicroFSBrowser extends JFrame {
         renameButton.setEnabled(hasRow);
         importButton.setEnabled(true);
         exportButton.setEnabled(hasRow);
+        exportAllButton.setEnabled(fs.isMounted() && fs.getFileCount() > 0);
         updateStatus();
     }
 
@@ -1032,6 +1038,94 @@ public class MicroFSBrowser extends JFrame {
         }
         int keep = Math.max(1, MicroFSManager.MAX_NAME_LENGTH - ext.length());
         return name.substring(0, Math.min(name.length(), keep)) + ext;
+    }
+
+    /**
+     * Exporta todos los archivos del medio a una carpeta del PC.
+     * Verifica cada archivo leyéndolo de nuevo y compara tamaños al final.
+     */
+    private void exportAll() {
+        if (!fs.isMounted() || fs.getFileCount() == 0) {
+            JOptionPane.showMessageDialog(this, "No hay archivos que exportar.",
+                    "Aviso", JOptionPane.WARNING_MESSAGE);
+            return;
+        }
+
+        JFileChooser chooser = newFileChooser();
+        chooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+        chooser.setDialogTitle("Carpeta donde guardar los " + fs.getFileCount() + " archivos");
+        if (chooser.showDialog(this, "Exportar aquí") != JFileChooser.APPROVE_OPTION) return;
+        rememberFolder(chooser);
+        File folder = chooser.getSelectedFile();
+
+        List<MicroFSManager.Entry> lista = fs.list();
+        int r = JOptionPane.showConfirmDialog(this,
+                "Se exportarán " + lista.size() + " archivos a:\n" + folder.getAbsolutePath() + "\n\n" +
+                "Si un archivo ya existe se preguntará antes de sobrescribirlo.\n" +
+                "Cada archivo se verifica byte a byte al escribirlo.",
+                "Exportar todos", JOptionPane.OK_CANCEL_OPTION, JOptionPane.QUESTION_MESSAGE);
+        if (r != JOptionPane.OK_OPTION) return;
+
+        List<String> nombres = new ArrayList<>();
+        for (MicroFSManager.Entry e : lista) nombres.add(e.getName());
+
+        StringBuilder fallos = new StringBuilder();
+        long[] bytes = new long[1];
+        int[] res;
+        try {
+            res = exportTo(fs, nombres, folder, (nombre, destino) ->
+                    JOptionPane.showConfirmDialog(this,
+                            "Ya existe " + destino.getName() + ".\n¿Sobrescribir?",
+                            "Archivo existente", JOptionPane.YES_NO_OPTION,
+                            JOptionPane.QUESTION_MESSAGE) == JOptionPane.YES_OPTION,
+                    fallos, bytes);
+        } catch (IOException ex) {
+            showError("No se pudo exportar", ex, fs.getDevice());
+            return;
+        }
+
+        String resumen = "Exportados " + res[0] + " de " + lista.size() + " archivos ("
+                + MicroFSManager.humanSize(bytes[0]) + ") en:\n" + folder.getAbsolutePath()
+                + (res[1] > 0 ? "\nOmitidos: " + res[1] : "")
+                + (res[2] > 0 ? "\nCon errores: " + res[2] + fallos : "");
+        log(resumen.replace("\n", " "));
+        JOptionPane.showMessageDialog(this, resumen,
+                res[2] > 0 ? "Exportación con errores" : "Exportación completada",
+                res[2] > 0 ? JOptionPane.WARNING_MESSAGE : JOptionPane.INFORMATION_MESSAGE);
+    }
+
+    /**
+     * Escribe los archivos indicados en la carpeta, comprobando byte a byte lo escrito.
+     *
+     * @return {exportados, omitidos, errores} y el detalle de fallos en el StringBuilder
+     */
+    static int[] exportTo(MicroFSManager model, List<String> nombres, File folder,
+                          java.util.function.BiPredicate<String, File> askOverwrite,
+                          StringBuilder fallos, long[] bytes) throws IOException {
+        int ok = 0;
+        int omitidos = 0;
+        int errores = 0;
+        for (String nombre : nombres) {
+            File destino = new File(folder, nombre);
+            if (destino.exists() && !askOverwrite.test(nombre, destino)) {
+                omitidos++;
+                continue;
+            }
+            try {
+                byte[] data = model.readFile(nombre);
+                Files.write(destino.toPath(), data);
+                byte[] releido = Files.readAllBytes(destino.toPath());
+                if (!java.util.Arrays.equals(data, releido)) {
+                    throw new IOException("el archivo escrito no coincide con el leído");
+                }
+                ok++;
+                bytes[0] += data.length;
+            } catch (IOException ex) {
+                errores++;
+                fallos.append("\n  ").append(nombre).append(": ").append(ex.getMessage());
+            }
+        }
+        return new int[]{ok, omitidos, errores};
     }
 
     private void exportSelected() {

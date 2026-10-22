@@ -281,13 +281,17 @@ final class DeviceAccess {
     static final class Powershell {
         private Powershell() {}
 
+        /**
+         * Ejecuta un script. Se escribe en un archivo .ps1 temporal y se lanza con -File:
+         * pasar scripts largos por -Command hace que Windows recorte la línea de comandos y el
+         * script se ejecute truncado (escapó como copias que escribían 0 bytes).
+         */
         static String run(String script) throws IOException {
             byte[] outBytes;
             int exit;
+            java.nio.file.Path ps1 = writeScript(script);
             try {
-                ProcessBuilder pb = new ProcessBuilder("powershell", "-NoProfile", "-NonInteractive",
-                        "-ExecutionPolicy", "Bypass", "-Command",
-                        "$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8; " + script);
+                ProcessBuilder pb = scriptProcess(ps1);
                 pb.redirectErrorStream(true);
                 Process process = pb.start();
                 ByteArrayOutputStream buffer = new ByteArrayOutputStream();
@@ -301,6 +305,12 @@ final class DeviceAccess {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IOException("Interrumpido", e);
+            } finally {
+                try {
+                    java.nio.file.Files.deleteIfExists(ps1);
+                } catch (IOException ignored) {
+                    // temporal
+                }
             }
             String output = new String(outBytes, StandardCharsets.UTF_8);
             if (exit != 0) {
@@ -313,6 +323,26 @@ final class DeviceAccess {
             return s.replace("'", "''");
         }
 
+        /** Escribe el script en un .ps1 temporal (UTF-8 con BOM) y devuelve la ruta. */
+        private static java.nio.file.Path writeScript(String script) throws IOException {
+            java.nio.file.Path ps1 = java.nio.file.Files.createTempFile("microfs", ".ps1");
+            String contenido = "$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8;\r\n"
+                    + "$ErrorActionPreference='Stop';\r\n" + script;
+            byte[] bytes = contenido.getBytes(StandardCharsets.UTF_8);
+            byte[] withBom = new byte[bytes.length + 3];
+            withBom[0] = (byte) 0xEF;
+            withBom[1] = (byte) 0xBB;
+            withBom[2] = (byte) 0xBF;
+            System.arraycopy(bytes, 0, withBom, 3, bytes.length);
+            java.nio.file.Files.write(ps1, withBom);
+            return ps1;
+        }
+
+        private static ProcessBuilder scriptProcess(java.nio.file.Path ps1) {
+            return new ProcessBuilder("powershell", "-NoProfile", "-NonInteractive",
+                    "-ExecutionPolicy", "Bypass", "-File", ps1.toAbsolutePath().toString());
+        }
+
         /**
          * Ejecuta un script largo (copias de medios) informando del progreso a partir del
          * tamaño del archivo que el script va generando.
@@ -322,14 +352,16 @@ final class DeviceAccess {
          */
         static void runWatching(String script, java.io.File watched, long total,
                                 java.util.function.DoubleConsumer progress) throws IOException {
+            java.nio.file.Path ps1 = writeScript(script);
             Process process;
             try {
-                ProcessBuilder pb = new ProcessBuilder("powershell", "-NoProfile", "-NonInteractive",
-                        "-ExecutionPolicy", "Bypass", "-Command",
-                        "$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8; " + script);
-                pb.redirectErrorStream(true);
-                process = pb.start();
+                process = scriptProcess(ps1).start();
             } catch (IOException ex) {
+                try {
+                    java.nio.file.Files.deleteIfExists(ps1);
+                } catch (IOException ignored) {
+                    // temporal
+                }
                 throw new IOException("No se pudo iniciar PowerShell", ex);
             }
 
@@ -376,6 +408,12 @@ final class DeviceAccess {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IOException("Interrumpido", e);
+            } finally {
+                try {
+                    java.nio.file.Files.deleteIfExists(ps1);
+                } catch (IOException ignored) {
+                    // temporal
+                }
             }
             String output = new String(buffer.toByteArray(), StandardCharsets.UTF_8);
             if (exit != 0) {
