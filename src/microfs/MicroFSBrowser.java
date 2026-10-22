@@ -1195,20 +1195,46 @@ public class MicroFSBrowser extends JFrame {
         boolean run(java.util.function.DoubleConsumer progress) throws IOException;
     }
 
-    /** Ejecuta una tarea con barra de progreso modal y devuelve true si terminó bien. */
+    /** Ejecuta una tarea con barra de progreso modal; se pueda cancelar con la X o el botón. */
     private boolean runWithProgress(String title, CopyTask task) throws IOException {
         JDialog dialog = new JDialog(this, title, true);
         JProgressBar bar = new JProgressBar(0, 1000);
         bar.setStringPainted(true);
         bar.setString("0 %");
-        dialog.add(BorderLayout.CENTER, bar);
-        dialog.add(BorderLayout.SOUTH, new JLabel(" No cierres esta ventana ni retires la tarjeta",
-                SwingConstants.CENTER));
-        dialog.setSize(420, 110);
+        JButton cancel = new JButton("Cancelar");
+        JPanel south = new JPanel(new BorderLayout());
+        south.add(new JLabel(" No retires la tarjeta", SwingConstants.CENTER), BorderLayout.CENTER);
+        south.add(cancel, BorderLayout.EAST);
+        dialog.add(bar, BorderLayout.CENTER);
+        dialog.add(south, BorderLayout.SOUTH);
+        dialog.setSize(460, 120);
         dialog.setLocationRelativeTo(this);
 
         final boolean[] ok = new boolean[1];
+        final boolean[] cancelled = new boolean[1];
         final IOException[] error = new IOException[1];
+        final Thread[] workerRef = new Thread[1];
+
+        // La X (y el botón) cancelan: se interrumpe el hilo y se cierra el diálogo.
+        dialog.setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
+        Runnable cancelar = () -> {
+            if (workerRef[0] != null && workerRef[0].isAlive()) {
+                cancelled[0] = true;
+                bar.setString("Cancelando…");
+                cancel.setEnabled(false);
+                workerRef[0].interrupt();
+            } else {
+                dialog.dispose();
+            }
+        };
+        dialog.addWindowListener(new java.awt.event.WindowAdapter() {
+            @Override
+            public void windowClosing(java.awt.event.WindowEvent e) {
+                cancelar.run();
+            }
+        });
+        cancel.addActionListener(e -> cancelar.run());
+
         Thread worker = new Thread(() -> {
             try {
                 ok[0] = task.run(progress -> {
@@ -1219,37 +1245,42 @@ public class MicroFSBrowser extends JFrame {
                     });
                 });
             } catch (IOException ex) {
-                error[0] = ex;
+                if (!cancelled[0]) error[0] = ex;
+            } finally {
+                SwingUtilities.invokeLater(dialog::dispose);
             }
         }, "microfs-copy");
+        workerRef[0] = worker;
         worker.start();
 
-        Thread watcher = new Thread(() -> {
-            try {
-                worker.join();
-            } catch (InterruptedException ignored) {
-                Thread.currentThread().interrupt();
-            }
-            SwingUtilities.invokeLater(dialog::dispose);
-        }, "microfs-copy-watch");
-        watcher.start();
-
-        dialog.setVisible(true); // modal hasta que el watcher la cierre
+        dialog.setVisible(true); // modal hasta que el hilo termine o se cancele
         try {
             worker.join();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+        if (cancelled[0]) return false;
         if (error[0] != null) throw error[0];
         return ok[0];
     }
 
     private void runCopy(String source, String target, boolean verify, String title) throws IOException {
         long t0 = System.currentTimeMillis();
-        runWithProgress(title, progress -> {
+        boolean cancelled = !runWithProgress(title, progress -> {
             MediumImager.copy(source, target, verify, progress);
             return true;
         });
+        if (cancelled) {
+            log("Copia cancelada: " + source + " -> " + target);
+            // Si el destino era un archivo parcial, se elimina para no confundirlo con una copia buena.
+            if (!target.startsWith(DeviceAccess.isWindows() ? "\\\\.\\" : "/dev/")) {
+                java.io.File parcial = new java.io.File(target);
+                if (parcial.isFile() && parcial.delete()) {
+                    log("Se eliminó la imagen incompleta: " + target);
+                }
+            }
+            return;
+        }
         long ms = System.currentTimeMillis() - t0;
         log(String.format("%s -> %s completado en %.1f s%s", source, target, ms / 1000.0,
                 verify ? " (verificado)" : ""));

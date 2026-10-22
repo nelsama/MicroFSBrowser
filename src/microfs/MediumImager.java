@@ -19,6 +19,8 @@ import java.util.function.DoubleConsumer;
 final class MediumImager {
 
     private static final int CHUNK = 256 * 1024;
+    /** Tamaño del bloque cuando se copia dentro del mismo proceso Java. */
+    private static final int FAST_CHUNK = 4 * 1024 * 1024;
 
     private MediumImager() {}
 
@@ -90,6 +92,10 @@ final class MediumImager {
     /**
      * Copia el origen completo al destino.
      *
+     * Cuando hay un dispositivo Windows por medio, la copia la hace UN ÚNICO proceso
+     * PowerShell (abrir un proceso cuesta ~300 ms; hacerlo por bloque tarda minutos u
+     * horas). El progreso se obtiene mirando cuánto ha crecido el archivo destino.
+     *
      * @param verify releer el destino y comparar al terminar
      * @param progress 0.0 a 1.0 (puede ser null)
      */
@@ -97,54 +103,122 @@ final class MediumImager {
             throws IOException {
         Plan plan = plan(source, target);
 
-        // Origen
-        try (DeviceAccess.Medium in = openForRead(source)) {
-            if (plan.targetIsDevice) {
-                DeviceAccess.ensureWindowsWritable(target);
-                try (DeviceAccess.Medium out = DeviceAccess.openMedium(target)) {
-                    stream(in, out, plan.sourceSize, progress);
-                }
+        boolean sourcePwsh = needsPowershell(source);
+        boolean targetPwsh = plan.targetIsDevice && needsPowershell(target);
+
+        if (!plan.targetIsDevice && sourcePwsh) {
+            // Dispositivo -> archivo: un solo proceso copia todo el medio.
+            copyDeviceToFile(source, target, plan.sourceSize, progress);
+        } else if (plan.targetIsDevice && targetPwsh) {
+            // Archivo -> dispositivo: un solo proceso escribe todo.
+            if (!sourcePwsh) {
+                copyFileToDevice(source, target, plan.sourceSize, progress);
             } else {
-                try (RandomAccessFile out = new RandomAccessFile(target, "rw")) {
-                    out.setLength(0);
-                    streamToFile(in, out, plan.sourceSize, progress);
+                // Dispositivo -> dispositivo: pasar por un archivo temporal.
+                Path tmp = Files.createTempFile("microfs_img", ".tmp");
+                try {
+                    copyDeviceToFile(source, tmp.toAbsolutePath().toString(), plan.sourceSize, progress);
+                    copyFileToDevice(tmp.toAbsolutePath().toString(), target, plan.sourceSize, null);
+                } finally {
+                    Files.deleteIfExists(tmp);
                 }
             }
+        } else {
+            copyWithJava(source, target, plan, progress);
         }
 
         if (verify) {
-            verifyCopy(source, target, plan.sourceSize);
+            verifyCopy(source, target, plan.sourceSize, progress);
         }
+    }
+
+    /** true si Windows impide abrir la ruta con Java y hay que usar PowerShell. */
+    private static boolean needsPowershell(String path) {
+        if (!DeviceAccess.isWindowsDevice(path)) return false;
+        try {
+            new RandomAccessFile(path, "r").close();
+            return false;
+        } catch (IOException ex) {
+            return true;
+        }
+    }
+
+    /** Copia directa con Java (imágenes, o cuando el dispositivo sí se puede abrir). */
+    private static void copyWithJava(String source, String target, Plan plan, DoubleConsumer progress)
+            throws IOException {
+        try (DeviceAccess.Medium in = openForRead(source);
+             RandomAccessFile out = new RandomAccessFile(target, "rw")) {
+            out.setLength(0);
+            byte[] buffer = new byte[FAST_CHUNK];
+            long done = 0;
+            while (done < plan.sourceSize) {
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new java.io.InterruptedIOException("Copia cancelada");
+                }
+                int n = (int) Math.min(FAST_CHUNK, plan.sourceSize - done);
+                in.read(done, buffer, n);
+                out.seek(done);
+                out.write(buffer, 0, n);
+                done += n;
+                report(progress, done, plan.sourceSize);
+            }
+        }
+    }
+
+    /**
+     * Dispositivo -> archivo en un solo proceso PowerShell.
+     * El script lee el medio y escribe el archivo; la JVM solo vigila el tamaño resultante.
+     */
+    private static void copyDeviceToFile(String device, String target, long total,
+                                         DoubleConsumer progress) throws IOException {
+        java.io.File file = new java.io.File(target);
+        java.io.File parent = file.getAbsoluteFile().getParentFile();
+        if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
+            throw new CopyException("No se puede crear la carpeta " + parent);
+        }
+        Files.deleteIfExists(Paths.get(target));
+
+        String script =
+                "$ErrorActionPreference='Stop'; " +
+                "try { " +
+                "  $src=[System.IO.File]::Open('" + DeviceAccess.Powershell.q(device) + "', 'Open', 'Read', 'ReadWrite'); " +
+                "  $dst=[System.IO.File]::Create('" + DeviceAccess.Powershell.q(file.getAbsolutePath()) + "'); " +
+                "  $buf=New-Object byte[] (4MB); $left=" + total + "; " +
+                "  while ($left -gt 0) { " +
+                "    $want=[Math]::Min($buf.Length, $left); " +
+                "    $n=$src.Read($buf, 0, $want); if ($n -le 0) { break } " +
+                "    $dst.Write($buf, 0, $n); $left -= $n }; " +
+                "  $dst.Flush(); $dst.Close(); $src.Close(); " +
+                "} catch { Write-Error $_.Exception.Message; exit 1 }";
+
+        DeviceAccess.Powershell.runWatching(script, file, total, progress);
+
+        long size = Files.size(file.toPath());
+        if (size != total) {
+            throw new CopyException("La copia quedó incompleta: " + MicroFSManager.humanSize(size)
+                    + " de " + MicroFSManager.humanSize(total) + ".");
+        }
+    }
+
+    /** Archivo -> dispositivo en un solo proceso PowerShell. */
+    private static void copyFileToDevice(String source, String device, long total,
+                                         DoubleConsumer progress) throws IOException {
+        if (DeviceAccess.isWindows() && DeviceAccess.isPhysicalDrive(device)) {
+            DeviceAccess.ensureWindowsWritable(device);
+        }
+        String script =
+                "$ErrorActionPreference='Stop'; " +
+                "try { " +
+                "  $bytes=[System.IO.File]::ReadAllBytes('" + DeviceAccess.Powershell.q(new java.io.File(source).getAbsolutePath()) + "'); " +
+                "  $dst=[System.IO.File]::Open('" + DeviceAccess.Powershell.q(device) + "', 'Open', 'Write', 'ReadWrite'); " +
+                "  $dst.Write($bytes, 0, $bytes.Length); $dst.Flush($true); $dst.Close(); " +
+                "  Write-Output $bytes.Length; " +
+                "} catch { Write-Error $_.Exception.Message; exit 1 }";
+        DeviceAccess.Powershell.run(script);
+        report(progress, total, total);
     }
 
     // ==================== Utilidades internas ====================
-
-    private static void stream(DeviceAccess.Medium in, DeviceAccess.Medium out, long total,
-                               DoubleConsumer progress) throws IOException {
-        byte[] buffer = new byte[CHUNK];
-        long done = 0;
-        while (done < total) {
-            int n = (int) Math.min(CHUNK, total - done);
-            in.read(done, buffer, n);
-            out.write(done, buffer, n);
-            done += n;
-            report(progress, done, total);
-        }
-    }
-
-    private static void streamToFile(DeviceAccess.Medium in, RandomAccessFile out, long total,
-                                     DoubleConsumer progress) throws IOException {
-        byte[] buffer = new byte[CHUNK];
-        long done = 0;
-        while (done < total) {
-            int n = (int) Math.min(CHUNK, total - done);
-            in.read(done, buffer, n);
-            out.seek(done);
-            out.write(buffer, 0, n);
-            done += n;
-            report(progress, done, total);
-        }
-    }
 
     private static void report(DoubleConsumer progress, long done, long total) {
         if (progress != null && total > 0) {
@@ -154,13 +228,33 @@ final class MediumImager {
 
     /** Relee el destino y compara con el origen. También devuelve el primer byte distinto. */
     static void verifyCopy(String source, String target, long size) throws IOException {
+        verifyCopy(source, target, size, null);
+    }
+
+    /** Relee el destino y compara con el origen, informando del progreso. */
+    static void verifyCopy(String source, String target, long size, DoubleConsumer progress)
+            throws IOException {
+        boolean sourcePwsh = needsPowershell(source);
+        boolean targetPwsh = needsPowershell(target);
+
+        if (sourcePwsh || targetPwsh) {
+            // Comparar dispositivo contra archivo en un solo proceso PowerShell.
+            String device = sourcePwsh ? source : target;
+            String file = sourcePwsh ? target : source;
+            verifyInPowershell(device, file, size, progress);
+            return;
+        }
+
         try (DeviceAccess.Medium a = openForRead(source);
              DeviceAccess.Medium b = openForRead(target)) {
-            byte[] bufA = new byte[CHUNK];
-            byte[] bufB = new byte[CHUNK];
+            byte[] bufA = new byte[FAST_CHUNK];
+            byte[] bufB = new byte[FAST_CHUNK];
             long offset = 0;
             while (offset < size) {
-                int n = (int) Math.min(CHUNK, size - offset);
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new java.io.InterruptedIOException("Verificación cancelada");
+                }
+                int n = (int) Math.min(FAST_CHUNK, size - offset);
                 a.read(offset, bufA, n);
                 b.read(offset, bufB, n);
                 for (int i = 0; i < n; i++) {
@@ -172,8 +266,31 @@ final class MediumImager {
                     }
                 }
                 offset += n;
+                report(progress, offset, size);
             }
         }
+    }
+
+    /** Contrasta dispositivo y archivo en un solo proceso; informa del byte del primer fallo. */
+    private static void verifyInPowershell(String device, String file, long size,
+                                          DoubleConsumer progress) throws IOException {
+        String script =
+                "$ErrorActionPreference='Stop'; " +
+                "try { " +
+                "  $dev=[System.IO.File]::Open('" + DeviceAccess.Powershell.q(device) + "', 'Open', 'Read', 'ReadWrite'); " +
+                "  $img=[System.IO.File]::OpenRead('" + DeviceAccess.Powershell.q(new java.io.File(file).getAbsolutePath()) + "'); " +
+                "  $a=New-Object byte[] (4MB); $b=New-Object byte[] (4MB); $pos=[long]0; $left=[long]" + size + "; " +
+                "  while ($left -gt 0) { " +
+                "    $want=[int][Math]::Min($a.Length, $left); " +
+                "    $na=$dev.Read($a, 0, $want); $nb=$img.Read($b, 0, $want); " +
+                "    if ($na -le 0 -or $nb -le 0) { throw ('Fin inesperado en el byte ' + $pos) } " +
+                "    for ($i=0; $i -lt $want; $i++) { " +
+                "      if ($a[$i] -ne $b[$i]) { throw ('Diferencia en el byte ' + ($pos + $i)) } }; " +
+                "    $pos += $want; $left -= $want }; " +
+                "  $dev.Close(); $img.Close(); " +
+                "  Write-Output ('OK ' + $pos); " +
+                "} catch { Write-Error $_.Exception.Message; exit 1 }";
+        DeviceAccess.Powershell.run(script);
     }
 
     private static DeviceAccess.Medium openForRead(String source) throws IOException {

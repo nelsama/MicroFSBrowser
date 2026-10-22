@@ -312,5 +312,76 @@ final class DeviceAccess {
         static String q(String s) {
             return s.replace("'", "''");
         }
+
+        /**
+         * Ejecuta un script largo (copias de medios) informando del progreso a partir del
+         * tamaño del archivo que el script va generando.
+         *
+         * @param watched archivo cuyo crecimiento representa el avance
+         * @param total tamaño final esperado
+         */
+        static void runWatching(String script, java.io.File watched, long total,
+                                java.util.function.DoubleConsumer progress) throws IOException {
+            Process process;
+            try {
+                ProcessBuilder pb = new ProcessBuilder("powershell", "-NoProfile", "-NonInteractive",
+                        "-ExecutionPolicy", "Bypass", "-Command",
+                        "$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8; " + script);
+                pb.redirectErrorStream(true);
+                process = pb.start();
+            } catch (IOException ex) {
+                throw new IOException("No se pudo iniciar PowerShell", ex);
+            }
+
+            // Leer la salida en segundo plano para que el proceso no se bloquee.
+            ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+            Thread reader = new Thread(() -> {
+                byte[] chunk = new byte[4096];
+                int n;
+                try {
+                    while ((n = process.getInputStream().read(chunk)) > 0) {
+                        buffer.write(chunk, 0, n);
+                    }
+                } catch (IOException ignored) {
+                    // el proceso terminó
+                }
+            }, "pwsh-output");
+            reader.setDaemon(true);
+            reader.start();
+
+            long last = -1;
+            while (process.isAlive()) {
+                if (Thread.currentThread().isInterrupted()) {
+                    process.destroyForcibly();
+                    throw new java.io.InterruptedIOException("Copia cancelada");
+                }
+                long size = watched.length();
+                if (size != last && progress != null) {
+                    last = size;
+                    progress.accept(total > 0 ? Math.min(1.0, (double) size / total) : 0);
+                }
+                try {
+                    Thread.sleep(120);
+                } catch (InterruptedException e) {
+                    process.destroyForcibly();
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Copia cancelada", e);
+                }
+            }
+
+            int exit;
+            try {
+                exit = process.exitValue();
+                reader.join(2000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("Interrumpido", e);
+            }
+            String output = new String(buffer.toByteArray(), StandardCharsets.UTF_8);
+            if (exit != 0) {
+                throw new IOException("PowerShell falló (" + exit + "): " + output.trim());
+            }
+            if (progress != null && total > 0) progress.accept(1.0);
+        }
     }
 }
